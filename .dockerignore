@@ -6,3 +6,5 @@ logs/
 .venv
 airflow.db
 airflow.cfg
+# Don't bake a local RAG index into the image
+include/.rag-incidents/

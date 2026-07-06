@@ -83,6 +83,40 @@ file are plaintext local dev config — never commit it (it's git-ignored for
 this reason), and avoid pasting live tokens into chat/tickets when sharing
 setup steps with teammates.
 
+## Incident Memory (RAG)
+
+The agentic incident response has a **persistent memory of past incidents**, so it can detect
+recurrence instead of re-diagnosing a solved problem, and leaves an institutional record of every
+outage (symptom → root cause → fix → ticket).
+
+**How it works** — in `agentic_snowflake_incident`, two deterministic tasks wrap the agent:
+
+- `recall_prior_incidents` runs **before** `investigate` and searches the memory for prior incidents
+  on the failed pipeline; any matches are fed into the agent's prompt as a leading hypothesis to
+  confirm.
+- `record_incident` runs **after** the Jira ticket is created and stores the diagnosis, keyed by the
+  ticket. (Re-recording the same ticket key updates the record in place — how a future close-sync
+  would flip it to `closed`.)
+
+It uses the [qbiz-agents](https://github.com/Qbizinc/qbiz-agents) **RAG engine as a library** (no MCP
+server) — see [`include/incident_memory.py`](include/incident_memory.py). Local embeddings
+(`fastembed`), so **no API key** is needed for the memory itself. The index + ledger persist under
+`RAG_DATA_DIR` (default `include/.rag-incidents`, set in the `Dockerfile`); it's on the Astro-mounted
+`include/` dir, so it survives across runs and is shared by the containers on one host. The directory
+is git-ignored.
+
+**Try it:**
+
+1. Trigger `novamart_incident_memory_seed` once to preload a couple of example incidents.
+2. Break `novamart_snowflake_sales` (e.g. `ALTER TABLE DAILY_SALES DROP COLUMN sku`, or set
+   `NOVAMART_INJECT_BAD_DATA=true`) and let it fail.
+3. Watch `agentic_snowflake_incident` recall the matching prior incident before it diagnoses, then
+   record the new one.
+
+Design and roadmap (pgvector for multi-worker scale, close-tracking sync DAG):
+[`RAG_INCIDENT_MEMORY_PLAN.md`](RAG_INCIDENT_MEMORY_PLAN.md). Memory is **best-effort** — if it's
+unavailable the incident response still runs; it just skips recall/record.
+
 ## Common Commands
 
 ```bash

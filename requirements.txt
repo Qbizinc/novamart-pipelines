@@ -7,3 +7,10 @@ snowflake-connector-python
 apache-airflow-providers-common-ai[anthropic]
 apache-airflow-providers-amazon
 sqlglot
+
+# Incident memory: the qbiz-agents RAG engine, installed as a library (see
+# RAG_INCIDENT_MEMORY_PLAN.md). Pinned to the feature branch because mcp/mcp_rag is not yet on
+# qbiz-agents `master` — it lands via PR #5 (feature/rag-mcp-scaffold). The base package is
+# engine-only (numpy + fastembed): no `mcp` runtime in the image. Once PR #5 merges, switch
+# `@feature/rag-mcp-scaffold` to `@master` (better: pin a release tag / commit SHA for reproducibility).
+qbiz-rag-mcp @ git+https://github.com/Qbizinc/qbiz-agents.git@feature/rag-mcp-scaffold#subdirectory=mcp/mcp_rag
