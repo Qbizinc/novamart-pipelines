@@ -7,66 +7,26 @@ Generates synthetic daily sales transactions and loads them into Snowflake
 On any failure the DAG automatically triggers agentic_snowflake_incident,
 which diagnoses the root cause, opens a Jira ticket, and posts to Slack.
 
+All credentials come from Airflow Connections (airflow_settings.yaml):
+- snowflake_default → Snowflake key-pair auth
+- airflow_api       → Airflow REST API (used by the failure callback)
+
 **Failure modes to try:**
 - Schema drift:  ALTER TABLE DAILY_SALES DROP COLUMN sku
 - Bad creds:     Remove the Snowflake private key file
 - Bad data:      Set NOVAMART_INJECT_BAD_DATA=true to generate records missing fields
 """
 
-import os
 import random
 import uuid
 from datetime import datetime, timezone
 
-import requests  # used in on_failure_callback
-import snowflake.connector
+from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
 from airflow.sdk import Variable, dag, task
 
+from include.novamart_utils import trigger_incident_dag
+
 SKUS = ["SKU-001", "SKU-002", "SKU-003", "SKU-004", "SKU-005"]
-
-
-def _snowflake_conn():
-    return snowflake.connector.connect(
-        account=Variable.get("SNOWFLAKE_ACCOUNT"),
-        user=Variable.get("SNOWFLAKE_USER"),
-        private_key_file=Variable.get("SNOWFLAKE_PRIVATE_KEY_PATH"),
-        database=Variable.get("SNOWFLAKE_DATABASE"),
-        schema=Variable.get("SNOWFLAKE_SCHEMA", default="NOVAMART_RAW"),
-        warehouse=Variable.get("SNOWFLAKE_WAREHOUSE"),
-        role=Variable.get("SNOWFLAKE_ROLE"),
-    )
-
-
-def _trigger_incident_dag(context):
-    """DAG on_failure_callback — fires agentic_snowflake_incident."""
-    airflow_url = os.environ.get("AIRFLOW_VAR_AIRFLOW_BASE_URL", "http://host.docker.internal:8080")
-    try:
-        token_r = requests.post(
-            f"{airflow_url}/auth/token",
-            json={
-                "username": os.environ.get("AIRFLOW_VAR_AIRFLOW_ADMIN_USER", "admin"),
-                "password": os.environ.get("AIRFLOW_VAR_AIRFLOW_ADMIN_PASSWORD", "admin"),
-            },
-            timeout=10,
-        )
-        token_r.raise_for_status()
-        jwt = token_r.json()["access_token"]
-        dag_run = context.get("dag_run")
-        run_id = dag_run.run_id if dag_run else "unknown"
-        from datetime import timezone
-        resp = requests.post(
-            f"{airflow_url}/api/v2/dags/agentic_snowflake_incident/dagRuns",
-            json={
-                "dag_run_id": f"incident__{run_id}",
-                "logical_date": datetime.now(timezone.utc).isoformat(),
-                "conf": {"failed_dag_id": "novamart_snowflake_sales", "failed_dag_run_id": run_id},
-            },
-            headers={"Authorization": f"Bearer {jwt}"},
-            timeout=10,
-        )
-        print(f"[on_failure_callback] HTTP {resp.status_code}: {resp.text[:300]}")
-    except Exception as exc:
-        print(f"[on_failure_callback] Could not trigger incident DAG: {exc}")
 
 
 @dag(
@@ -76,7 +36,7 @@ def _trigger_incident_dag(context):
     catchup=False,
     doc_md=__doc__,
     tags=["novamart", "sales", "snowflake"],
-    default_args={"on_failure_callback": _trigger_incident_dag},
+    default_args={"on_failure_callback": trigger_incident_dag},
 )
 def novamart_snowflake_sales():
 
@@ -115,7 +75,7 @@ def novamart_snowflake_sales():
     @task
     def ensure_table() -> None:
         """Create DAILY_SALES in Snowflake if it doesn't exist yet."""
-        conn = _snowflake_conn()
+        conn = SnowflakeHook(snowflake_conn_id="snowflake_default").get_conn()
         try:
             conn.cursor().execute("""
                 CREATE TABLE IF NOT EXISTS DAILY_SALES (
@@ -135,7 +95,7 @@ def novamart_snowflake_sales():
     @task
     def load_to_snowflake(transactions: list[dict]) -> None:
         """Replace today's rows in DAILY_SALES — delete then insert for idempotency."""
-        conn = _snowflake_conn()
+        conn = SnowflakeHook(snowflake_conn_id="snowflake_default").get_conn()
         try:
             cur = conn.cursor()
             business_date = transactions[0]["timestamp"][:10]

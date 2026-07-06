@@ -2,196 +2,41 @@
 ## Agentic Snowflake Incident DAG
 
 Triggered automatically when novamart_snowflake_sales fails, or manually
-from the UI. Claude investigates using Airflow task logs and live Snowflake
-queries, opens a Jira ticket with a structured diagnosis, and posts to Slack.
+from the UI. Claude investigates using pre-fetched Airflow task logs and
+live Snowflake queries; the DAG then deterministically opens a Jira ticket
+from that diagnosis and posts to Slack.
 
-### Required Airflow Variables
-- SNOWFLAKE_ACCOUNT, SNOWFLAKE_USER, SNOWFLAKE_PASSWORD
-- SNOWFLAKE_DATABASE, SNOWFLAKE_SCHEMA, SNOWFLAKE_WAREHOUSE, SNOWFLAKE_ROLE
-- JIRA_URL, JIRA_EMAIL, JIRA_API_TOKEN, JIRA_PROJECT_KEY
-- SLACK_BOT_TOKEN, SLACK_INCIDENT_CHANNEL
-- ANTHROPIC_API_KEY
-- AIRFLOW_BASE_URL, AIRFLOW_ADMIN_USER, AIRFLOW_ADMIN_PASSWORD
+Uses apache-airflow-providers-common-ai:
+- @task.agent  — LLM agent loop (pydantic-ai, Anthropic backend), used only
+  for investigation (Snowflake queries). Ticket creation and Slack posting
+  are plain, deterministic tasks that run strictly after the investigation
+  finishes — not decisions the agent makes, so they happen exactly once.
+- SQLToolset   — Snowflake queries via snowflake_default connection
+
+### Required Airflow Connections (set in airflow_settings.yaml)
+- snowflake_default : Snowflake, key-pair auth
+- jira_api          : HTTP, qbizinc.atlassian.net, Basic auth
+- slack_api         : Slack, bot token
+- airflow_api       : HTTP, host.docker.internal:8080, admin/admin
+
+### Required environment variable (set in .env, no AIRFLOW_VAR_ prefix)
+- ANTHROPIC_API_KEY  — read directly by the Anthropic SDK
+
+### Required Airflow Variable (set in airflow_settings.yaml)
+- SLACK_INCIDENT_CHANNEL
 """
 
-import base64
 import json
-import os
 from datetime import datetime
 
 import requests
-import snowflake.connector
+from airflow.providers.http.hooks.http import HttpHook
+from airflow.providers.slack.hooks.slack import SlackHook
 from airflow.sdk import Variable, dag, task
 
-# ---------------------------------------------------------------------------
-# Tool definitions for the Claude agent
-# ---------------------------------------------------------------------------
-
-AGENT_TOOLS = [
-    {
-        "name": "get_task_logs",
-        "description": "Retrieve logs for a specific failed Airflow task instance.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "dag_id": {"type": "string"},
-                "dag_run_id": {"type": "string"},
-                "task_id": {"type": "string"},
-            },
-            "required": ["dag_id", "dag_run_id", "task_id"],
-        },
-    },
-    {
-        "name": "query_snowflake",
-        "description": (
-            "Execute a read-only SQL query against the NovaMart Snowflake database. "
-            "Use to inspect table schema (DESCRIBE TABLE), row counts, data freshness "
-            "(MAX loaded_at), and samples. Only SELECT, DESCRIBE, and SHOW are allowed."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "sql": {"type": "string", "description": "Read-only SQL (SELECT / DESCRIBE / SHOW)."},
-            },
-            "required": ["sql"],
-        },
-    },
-    {
-        "name": "create_jira_ticket",
-        "description": (
-            "Create a Jira bug ticket to track this incident. "
-            "Call this exactly once after you have a complete diagnosis."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "summary": {"type": "string", "description": "Short one-line ticket title."},
-                "description": {
-                    "type": "string",
-                    "description": (
-                        "Full diagnosis using this format:\n"
-                        "[DIAGNOSIS] what went wrong\n"
-                        "[ROOT CAUSE] why it happened\n"
-                        "[IMPACT] what data is missing or corrupted\n"
-                        "[RECOMMENDED FIX] concrete steps to resolve"
-                    ),
-                },
-            },
-            "required": ["summary", "description"],
-        },
-    },
-]
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
-def _airflow_headers() -> dict:
-    airflow_url = Variable.get("AIRFLOW_BASE_URL", default="http://host.docker.internal:8080")
-    r = requests.post(
-        f"{airflow_url}/auth/token",
-        json={
-            "username": Variable.get("AIRFLOW_ADMIN_USER", default="admin"),
-            "password": Variable.get("AIRFLOW_ADMIN_PASSWORD", default="admin"),
-        },
-        timeout=10,
-    )
-    r.raise_for_status()
-    return {"Authorization": f"Bearer {r.json()['access_token']}"}
-
-
-def _snowflake_conn():
-    return snowflake.connector.connect(
-        account=Variable.get("SNOWFLAKE_ACCOUNT"),
-        user=Variable.get("SNOWFLAKE_USER"),
-        private_key_file=Variable.get("SNOWFLAKE_PRIVATE_KEY_PATH"),
-        database=Variable.get("SNOWFLAKE_DATABASE"),
-        schema=Variable.get("SNOWFLAKE_SCHEMA", default="NOVAMART_RAW"),
-        warehouse=Variable.get("SNOWFLAKE_WAREHOUSE"),
-        role=Variable.get("SNOWFLAKE_ROLE"),
-    )
-
-
-def _execute_tool(tool_name: str, tool_input: dict) -> str:
-    airflow_url = Variable.get("AIRFLOW_BASE_URL", default="http://host.docker.internal:8080")
-
-    if tool_name == "get_task_logs":
-        dag_id = tool_input["dag_id"]
-        run_id = tool_input["dag_run_id"]
-        task_id = tool_input["task_id"]
-        try:
-            headers = _airflow_headers()
-            r = requests.get(
-                f"{airflow_url}/api/v2/dags/{dag_id}/dagRuns/{run_id}/taskInstances/{task_id}/logs/1",
-                headers=headers,
-                timeout=15,
-            )
-            return r.text[:4000]
-        except Exception as exc:
-            return json.dumps({"error": str(exc)})
-
-    if tool_name == "query_snowflake":
-        sql = tool_input["sql"].strip()
-        first_word = sql.split()[0].upper() if sql else ""
-        if first_word not in ("SELECT", "DESCRIBE", "DESC", "SHOW"):
-            return json.dumps({"error": "Only SELECT, DESCRIBE, and SHOW statements are permitted."})
-        try:
-            conn = _snowflake_conn()
-            try:
-                cur = conn.cursor()
-                cur.execute(sql)
-                rows = cur.fetchmany(50)
-                cols = [desc[0] for desc in cur.description] if cur.description else []
-                return json.dumps({"columns": cols, "rows": [list(r) for r in rows]}, default=str)
-            finally:
-                conn.close()
-        except Exception as exc:
-            return json.dumps({"error": str(exc)})
-
-    if tool_name == "create_jira_ticket":
-        jira_url = Variable.get("JIRA_URL")
-        email = Variable.get("JIRA_EMAIL")
-        token = Variable.get("JIRA_API_TOKEN")
-        project = Variable.get("JIRA_PROJECT_KEY", default="DATA")
-        creds = base64.b64encode(f"{email}:{token}".encode()).decode()
-        try:
-            r = requests.post(
-                f"{jira_url}/rest/api/3/issue",
-                headers={"Authorization": f"Basic {creds}", "Content-Type": "application/json"},
-                json={
-                    "fields": {
-                        "project": {"key": project},
-                        "summary": tool_input["summary"],
-                        "description": {
-                            "type": "doc",
-                            "version": 1,
-                            "content": [
-                                {
-                                    "type": "paragraph",
-                                    "content": [{"type": "text", "text": tool_input["description"]}],
-                                }
-                            ],
-                        },
-                        "issuetype": {"name": "Bug"},
-                    }
-                },
-                timeout=15,
-            )
-            r.raise_for_status()
-            data = r.json()
-            ticket_url = f"{jira_url}/browse/{data['key']}"
-            print(f"[create_jira_ticket] Created {data['key']}: {ticket_url}")
-            return json.dumps({"key": data["key"], "url": ticket_url})
-        except Exception as exc:
-            return json.dumps({"error": str(exc)})
-
-    return json.dumps({"error": f"Unknown tool: {tool_name}"})
-
-
-# ---------------------------------------------------------------------------
-# DAG
-# ---------------------------------------------------------------------------
+# Register @task.agent with the airflow.sdk task namespace
+from airflow.providers.common.ai.decorators import agent as _agent_decorator  # noqa: F401
+from airflow.providers.common.ai.toolsets.sql import SQLToolset
 
 
 @dag(
@@ -205,29 +50,48 @@ def _execute_tool(tool_name: str, tool_input: dict) -> str:
 def agentic_snowflake_incident():
 
     @task
-    def gather_context() -> dict:
-        """Find the most recent failed novamart_snowflake_sales run and its failed tasks."""
-        failed_dag_id = "novamart_snowflake_sales"
-        airflow_url = Variable.get("AIRFLOW_BASE_URL", default="http://host.docker.internal:8080")
-        headers = _airflow_headers()
+    def gather_context(dag_run=None) -> dict:
+        """Find the failed run to investigate and pre-fetch logs for each failed task.
 
-        r = requests.get(
-            f"{airflow_url}/api/v2/dags/{failed_dag_id}/dagRuns",
-            params={"state": "failed", "limit": 1, "order_by": "-start_date"},
-            headers=headers,
+        When triggered by a pipeline's on_failure_callback, failed_dag_id/failed_dag_run_id
+        come from the triggering conf. When triggered manually with no conf, falls back to
+        the most recent failed run of novamart_snowflake_sales.
+        """
+        conf = (dag_run.conf if dag_run else None) or {}
+        failed_dag_id = conf.get("failed_dag_id", "novamart_snowflake_sales")
+        failed_run_id = conf.get("failed_dag_run_id")
+
+        # Pull credentials from the airflow_api connection — no Variables
+        conn = HttpHook(http_conn_id="airflow_api").get_connection("airflow_api")
+        base_url = f"{conn.schema or 'http'}://{conn.host}:{conn.port or 8080}"
+
+        token_r = requests.post(
+            f"{base_url}/auth/token",
+            json={"username": conn.login, "password": conn.password},
             timeout=10,
         )
-        runs = r.json().get("dag_runs", [])
-        if not runs:
-            raise ValueError(f"No failed runs found for {failed_dag_id}.")
+        token_r.raise_for_status()
+        headers = {"Authorization": f"Bearer {token_r.json()['access_token']}"}
 
-        failed_dag_run_id = runs[0]["dag_run_id"]
+        if not failed_run_id:
+            r = requests.get(
+                f"{base_url}/api/v2/dags/{failed_dag_id}/dagRuns",
+                params={"state": "failed", "limit": 1, "order_by": "-start_date"},
+                headers=headers,
+                timeout=10,
+            )
+            r.raise_for_status()
+            runs = r.json().get("dag_runs", [])
+            if not runs:
+                raise ValueError(f"No failed runs found for {failed_dag_id}.")
+            failed_run_id = runs[0]["dag_run_id"]
 
         r2 = requests.get(
-            f"{airflow_url}/api/v2/dags/{failed_dag_id}/dagRuns/{failed_dag_run_id}/taskInstances",
+            f"{base_url}/api/v2/dags/{failed_dag_id}/dagRuns/{failed_run_id}/taskInstances",
             headers=headers,
             timeout=10,
         )
+        r2.raise_for_status()
         instances = r2.json().get("task_instances", [])
         failed_tasks = [
             {"task_id": t["task_id"], "state": t["state"]}
@@ -235,103 +99,151 @@ def agentic_snowflake_incident():
             if t["state"] == "failed"
         ]
 
-        print(f"[gather_context] run={failed_dag_run_id}, failed_tasks={failed_tasks}")
+        task_logs: dict[str, str] = {}
+        for t in failed_tasks:
+            log_r = requests.get(
+                f"{base_url}/api/v2/dags/{failed_dag_id}/dagRuns/{failed_run_id}"
+                f"/taskInstances/{t['task_id']}/logs/1",
+                headers=headers,
+                timeout=15,
+            )
+            task_logs[t["task_id"]] = log_r.text[:4000]
+
+        source_r = requests.get(
+            f"{base_url}/api/v2/dagSources/{failed_dag_id}",
+            headers=headers,
+            timeout=10,
+        )
+        source_r.raise_for_status()
+        dag_source = source_r.json().get("content", "")
+
+        print(f"[gather_context] dag={failed_dag_id}, run={failed_run_id}, "
+              f"failed={[t['task_id'] for t in failed_tasks]}")
         return {
             "failed_dag_id": failed_dag_id,
-            "failed_dag_run_id": failed_dag_run_id,
+            "failed_dag_run_id": failed_run_id,
             "failed_tasks": failed_tasks,
+            "task_logs": task_logs,
+            "dag_source": dag_source,
         }
 
-    @task
-    def run_agent(ctx: dict) -> dict:
-        """Claude investigates via Airflow logs + Snowflake queries, then opens a Jira ticket."""
-        import anthropic
+    @task.agent(
+        toolsets=[
+            SQLToolset(db_conn_id="snowflake_default"),
+        ],
+        llm_conn_id="pydanticai_default",
+        model_id="anthropic:claude-sonnet-4-6",
+    )
+    def investigate(ctx: dict) -> str:
+        """Return the prompt for the agent based on the gathered context.
 
-        api_key = os.environ.get("ANTHROPIC_API_KEY") or Variable.get("ANTHROPIC_API_KEY")
-        client = anthropic.Anthropic(api_key=api_key)
-
-        system_prompt = (
-            "You are a data platform reliability engineer at NovaMart. "
-            "A pipeline that loads daily sales data into Snowflake has failed.\n\n"
-            "Investigation steps:\n"
-            "1. Call get_task_logs for each failed task to read the exact error and traceback.\n"
-            "2. Call query_snowflake to inspect the current table state:\n"
-            "   - DESCRIBE TABLE DAILY_SALES  (check for schema drift or missing columns)\n"
-            "   - SELECT COUNT(*), MAX(loaded_at) FROM DAILY_SALES  (check freshness and row count)\n"
-            "3. Determine the root cause from the evidence.\n"
-            "4. Call create_jira_ticket exactly once with a complete, structured description.\n\n"
-            "IMPORTANT: Never ask for more information. Use only the tools provided. "
-            "If a tool call fails, note it and continue with available evidence."
+        This agent only has the SQL tool — it cannot create a Jira ticket or post to
+        Slack itself. Those happen in separate, deterministic tasks that run strictly
+        after this one finishes, so the investigation always completes before any
+        ticket/message is created, and exactly once.
+        """
+        tasks_summary = "\n".join(
+            f"  - {t['task_id']} ({t['state']})" for t in ctx["failed_tasks"]
         )
-
-        user_message = (
-            f"novamart_snowflake_sales has failed.\n"
+        logs_section = "\n\n".join(
+            f"=== {tid} ===\n{log}" for tid, log in ctx.get("task_logs", {}).items()
+        )
+        return (
+            f"{ctx['failed_dag_id']} has failed.\n"
             f"DAG run ID: {ctx['failed_dag_run_id']}\n"
-            f"Failed tasks: {json.dumps(ctx['failed_tasks'])}\n\n"
-            "Investigate and open a Jira ticket with your findings."
+            f"Failed tasks:\n{tasks_summary}\n\n"
+            f"Task logs:\n{logs_section}\n\n"
+            f"Pipeline source code ({ctx['failed_dag_id']}.py):\n"
+            f"```python\n{ctx.get('dag_source', '')}\n```\n\n"
+            "Investigation steps:\n"
+            "1. Read the pipeline source code above first. Identify exactly how each write/"
+            "match/dedup key is constructed (e.g. is it a stable business key, or something "
+            "regenerated fresh on every run?). Your root cause must be grounded in what the "
+            "code actually does, not just inferred from the shape of the data — a plausible-"
+            "looking guess (e.g. \"missing a GROUP BY\") is wrong if the code doesn't show that.\n"
+            "2. Use the SQL tool to check for schema drift on any table referenced in the "
+            "failed task logs, e.g.:\n"
+            "   DESCRIBE TABLE SANDBOX_DATA_PIPELINE.NOVAMART_RAW.<table_name>\n"
+            "3. Use the SQL tool to check data freshness/state on that table, e.g.:\n"
+            "   SELECT COUNT(*), MAX(loaded_at) FROM SANDBOX_DATA_PIPELINE.NOVAMART_RAW.<table_name>\n"
+            "4. Use the Snowflake evidence to confirm (or rule out) the mechanism you identified "
+            "in step 1 — the data pattern should match what the code predicts, not just look "
+            "superficially similar.\n"
+            "5. Return your findings as plain structured text, in exactly this format "
+            "(this is the final answer — you have no other tools to call after this):\n"
+            "   [SUMMARY] one-line ticket title\n"
+            "   [DIAGNOSIS] what went wrong\n"
+            "   [ROOT CAUSE] why it happened\n"
+            "   [IMPACT] what data is missing or affected\n"
+            "   [RECOMMENDED FIX] concrete steps to resolve"
         )
 
-        messages = [{"role": "user", "content": user_message}]
-        jira_ticket = None
+    @task
+    def create_jira_ticket(diagnosis: str, failed_dag_id: str) -> dict:
+        """Create exactly one Jira Bug ticket from the agent's diagnosis.
 
-        for _ in range(12):
-            response = client.messages.create(
-                model="claude-sonnet-4-6",
-                max_tokens=2048,
-                system=system_prompt,
-                tools=AGENT_TOOLS,
-                messages=messages,
-            )
-            messages.append({"role": "assistant", "content": response.content})
+        Deterministic, not an agent decision — runs once, strictly after investigate()
+        completes, so ticket creation can never be repeated or interleaved with the
+        investigation the way it was when the agent held its own Jira tool.
+        """
+        summary = f"{failed_dag_id} pipeline failure"
+        body = diagnosis
+        if diagnosis.startswith("[SUMMARY]"):
+            first_line, _, rest = diagnosis.partition("\n")
+            summary = first_line.removeprefix("[SUMMARY]").strip() or summary
+            body = rest.strip()
 
-            if response.stop_reason == "end_turn":
-                diagnosis = next((b.text for b in response.content if hasattr(b, "text")), "")
-                return {"diagnosis": diagnosis, "jira_ticket": jira_ticket}
-
-            if response.stop_reason == "tool_use":
-                tool_results = []
-                for block in response.content:
-                    if block.type == "tool_use":
-                        result = _execute_tool(block.name, block.input)
-                        if block.name == "create_jira_ticket":
-                            parsed = json.loads(result)
-                            if "key" in parsed:
-                                jira_ticket = parsed
-                        tool_results.append({
-                            "type": "tool_result",
-                            "tool_use_id": block.id,
-                            "content": result,
-                        })
-                messages.append({"role": "user", "content": tool_results})
-
-        return {"diagnosis": "Agent reached the iteration limit without a conclusion.", "jira_ticket": jira_ticket}
+        response = HttpHook(method="POST", http_conn_id="jira_api").run(
+            endpoint="/rest/api/3/issue",
+            data=json.dumps({
+                "fields": {
+                    "project": {"key": "AD"},
+                    "summary": summary,
+                    "description": {
+                        "type": "doc",
+                        "version": 1,
+                        "content": [
+                            {"type": "paragraph", "content": [{"type": "text", "text": body}]}
+                        ],
+                    },
+                    "issuetype": {"name": "Bug"},
+                }
+            }),
+            headers={"Content-Type": "application/json"},
+        )
+        data = response.json()
+        ticket = {"key": data["key"], "url": f"https://qbizinc.atlassian.net/browse/{data['key']}"}
+        print(f"[create_jira_ticket] Created {ticket['key']}: {ticket['url']}")
+        return ticket
 
     @task
-    def post_to_slack(result: dict) -> None:
-        """Post the diagnosis and Jira ticket link to the Slack incident channel."""
-        from slack_sdk import WebClient
+    def post_to_slack(diagnosis: str, failed_dag_id: str, ticket: dict) -> None:
+        """Post the agent's diagnosis, with the Jira ticket link, to the Slack incident channel."""
+        slack = SlackHook(slack_conn_id="slack_api")
+        channel = Variable.get("SLACK_INCIDENT_CHANNEL", default="#qbiz_slackbot_testing")
+        jira_line = f"  |  <{ticket['url']}|{ticket['key']}>" if ticket.get("key") else ""
 
-        token = os.environ.get("SLACK_BOT_TOKEN") or Variable.get("SLACK_BOT_TOKEN")
-        channel = Variable.get("SLACK_INCIDENT_CHANNEL", default="#data-incidents")
-        slack = WebClient(token=token)
-
-        jira = result.get("jira_ticket")
-        jira_line = f"  |  :jira: <{jira['url']}|{jira['key']}>" if jira else ""
-
-        header_ts = slack.chat_postMessage(
-            channel=channel,
-            text=f":rotating_light: *NovaMart — Snowflake Sales Pipeline Failure*{jira_line}",
+        header_ts = slack.call(
+            "chat.postMessage",
+            json={
+                "channel": channel,
+                "text": f":rotating_light: *NovaMart — {failed_dag_id} Pipeline Failure*{jira_line}",
+            },
         )["ts"]
 
-        slack.chat_postMessage(
-            channel=channel,
-            text=f"```{result.get('diagnosis', 'No diagnosis produced.')}```",
-            thread_ts=header_ts,
+        slack.call(
+            "chat.postMessage",
+            json={
+                "channel": channel,
+                "text": f"```{diagnosis[:3800]}```",
+                "thread_ts": header_ts,
+            },
         )
 
     ctx = gather_context()
-    result = run_agent(ctx)
-    post_to_slack(result)
+    diagnosis = investigate(ctx)
+    ticket = create_jira_ticket(diagnosis, ctx["failed_dag_id"])
+    post_to_slack(diagnosis, ctx["failed_dag_id"], ticket)
 
 
 agentic_snowflake_incident()
