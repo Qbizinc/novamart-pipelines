@@ -1,52 +1,49 @@
 """
 Shared utilities for NovaMart pipeline DAGs.
+
+Note on retries: these are toy/demo DAGs used to showcase the agentic
+incident-response pattern, not production pipelines. Their failures are
+deterministic (a Variable/Connection was deliberately misconfigured for the
+demo), so retrying wouldn't change the outcome — it would only delay
+trigger_incident_dag firing and burn extra Snowflake/API/AWS calls for no
+benefit. DAGs using trigger_incident_dag intentionally omit `retries` from
+default_args (leaving it at the implicit default of 0) to keep the demo
+fast and cheap to run.
 """
 
-import os
+from datetime import datetime, timezone
 
 import requests
-
-
-# Map each pipeline DAG to the service name the incident DAG understands
-_DAG_TO_PIPELINE = {
-    "novamart_daily_sales": "sales",
-    "novamart_customer_loyalty": "customer",
-    "novamart_marketing_ads": "marketing",
-}
-
-_AIRFLOW_URL = os.environ.get("AIRFLOW_VAR_AIRFLOW_BASE_URL", "http://localhost:8080")
-_AIRFLOW_USER = os.environ.get("AIRFLOW_VAR_AIRFLOW_ADMIN_USER", "admin")
-_AIRFLOW_PASSWORD = os.environ.get("AIRFLOW_VAR_AIRFLOW_ADMIN_PASSWORD", "admin")
+from airflow.providers.http.hooks.http import HttpHook
 
 
 def trigger_incident_dag(context) -> None:
-    """
-    on_failure_callback that fires the agentic_incident_dag whenever a
-    NovaMart pipeline task fails. Passes the failed DAG/run/task info so
-    the agent can pull Airflow logs as part of its investigation.
-    """
-    dag_run = context["dag_run"]
-    task_instance = context["task_instance"]
-    dag_id = dag_run.dag_id
-
-    pipeline = _DAG_TO_PIPELINE.get(dag_id, "all")
-
-    conf = {
-        "pipeline": pipeline,
-        "dag_id": dag_id,
-        "run_id": dag_run.run_id,
-        "failed_task": task_instance.task_id,
-    }
-
+    """Task on_failure_callback — fires agentic_snowflake_incident via the Airflow REST API."""
     try:
-        response = requests.post(
-            f"{_AIRFLOW_URL}/api/v2/dags/agentic_incident_dag/dagRuns",
-            json={"conf": conf},
-            auth=(_AIRFLOW_USER, _AIRFLOW_PASSWORD),
+        conn = HttpHook(http_conn_id="airflow_api").get_connection("airflow_api")
+        base_url = f"{conn.schema or 'http'}://{conn.host}:{conn.port or 8080}"
+
+        token_r = requests.post(
+            f"{base_url}/auth/token",
+            json={"username": conn.login, "password": conn.password},
             timeout=10,
         )
-        response.raise_for_status()
-        print(f"[incident] Triggered agentic_incident_dag for {dag_id} — run_id: {response.json().get('run_id')}")
+        token_r.raise_for_status()
+        jwt = token_r.json()["access_token"]
+
+        dag_run = context.get("dag_run")
+        run_id = dag_run.run_id if dag_run else "unknown"
+        failed_dag_id = context["dag"].dag_id
+        resp = requests.post(
+            f"{base_url}/api/v2/dags/agentic_snowflake_incident/dagRuns",
+            json={
+                "dag_run_id": f"incident__{run_id}",
+                "logical_date": datetime.now(timezone.utc).isoformat(),
+                "conf": {"failed_dag_id": failed_dag_id, "failed_dag_run_id": run_id},
+            },
+            headers={"Authorization": f"Bearer {jwt}"},
+            timeout=10,
+        )
+        print(f"[on_failure_callback] HTTP {resp.status_code}: {resp.text[:300]}")
     except Exception as exc:
-        # Log but don't re-raise — we don't want the callback itself to obscure the original failure
-        print(f"[incident] WARNING: Failed to trigger agentic_incident_dag: {exc}")
+        print(f"[on_failure_callback] Could not trigger incident DAG: {exc}")
