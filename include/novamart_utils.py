@@ -1,5 +1,14 @@
 """
 Shared utilities for NovaMart pipeline DAGs.
+
+Note on retries: these are toy/demo DAGs used to showcase the agentic
+incident-response pattern, not production pipelines. Their failures are
+deterministic (a Variable/Connection was deliberately misconfigured for the
+demo), so retrying wouldn't change the outcome — it would only delay
+trigger_incident_dag firing and burn extra Snowflake/API/AWS calls for no
+benefit. DAGs using trigger_incident_dag intentionally omit `retries` from
+default_args (leaving it at the implicit default of 0) to keep the demo
+fast and cheap to run.
 """
 
 from datetime import datetime, timezone
