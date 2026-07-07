@@ -9,8 +9,9 @@ apache-airflow-providers-amazon
 sqlglot
 
 # Incident memory: the qbiz-agents RAG engine, installed as a library (see
-# RAG_INCIDENT_MEMORY_PLAN.md). Pinned to the feature branch because mcp/mcp_rag is not yet on
-# qbiz-agents `master` — it lands via PR #5 (feature/rag-mcp-scaffold). The base package is
-# engine-only (numpy + fastembed): no `mcp` runtime in the image. Once PR #5 merges, switch
-# `@feature/rag-mcp-scaffold` to `@master` (better: pin a release tag / commit SHA for reproducibility).
-qbiz-rag-mcp @ git+https://github.com/Qbizinc/qbiz-agents.git@feature/rag-mcp-scaffold#subdirectory=mcp/mcp_rag
+# RAG_INCIDENT_MEMORY_PLAN.md). qbiz-agents PR #5 (feature/rag-mcp-scaffold) has merged to
+# master, so this pins to a commit SHA on master rather than a feature branch (a branch can
+# move or be deleted out from under this; a SHA can't). Bump the SHA deliberately when the
+# engine needs updating. The base package is engine-only (numpy + fastembed): no `mcp` runtime
+# in the image.
+qbiz-rag-mcp @ git+https://github.com/Qbizinc/qbiz-agents.git@09e1f065cf3098cb5c5f6a0766cf99d0be953049#subdirectory=mcp/mcp_rag
