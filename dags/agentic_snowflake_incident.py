@@ -24,6 +24,13 @@ Uses apache-airflow-providers-common-ai:
 
 ### Required Airflow Variable (set in airflow_settings.yaml)
 - SLACK_INCIDENT_CHANNEL
+
+### Incident memory (RAG)
+Before diagnosing, the DAG recalls prior incidents on the failed pipeline (recurrence detection);
+after opening the ticket it records the incident, keyed by the ticket. Uses the qbiz-agents RAG
+engine as a library — see include/incident_memory.py. Persists under RAG_DATA_DIR
+(default include/.rag-incidents, set in the Dockerfile). Run novamart_incident_memory_seed once to
+preload example incidents. Full design: RAG_INCIDENT_MEMORY_PLAN.md.
 """
 
 import json
@@ -37,6 +44,10 @@ from airflow.sdk import Variable, dag, task
 # Register @task.agent with the airflow.sdk task namespace
 from airflow.providers.common.ai.decorators import agent as _agent_decorator  # noqa: F401
 from airflow.providers.common.ai.toolsets.sql import SQLToolset
+
+# Incident memory (RAG, library embed — see include/incident_memory.py + RAG_INCIDENT_MEMORY_PLAN.md).
+# Imported at module top is safe: it does no heavy work and defers the rag_mcp import to task runtime.
+from include import incident_memory
 
 
 @dag(
@@ -127,6 +138,18 @@ def agentic_snowflake_incident():
             "dag_source": dag_source,
         }
 
+    @task
+    def recall_prior_incidents(ctx: dict) -> str:
+        """Search incident memory for prior occurrences on this pipeline (recurrence detection).
+
+        Deterministic pre-fetch: runs before investigate() and feeds any matches into its prompt so
+        the recurrence context is guaranteed present without relying on the agent to look it up.
+        Returns an empty string when there's no prior history (or if the memory is unavailable).
+        """
+        return incident_memory.recall_similar_incidents(
+            ctx["failed_dag_id"], ctx.get("task_logs", {})
+        )
+
     @task.agent(
         toolsets=[
             SQLToolset(db_conn_id="snowflake_default"),
@@ -134,7 +157,7 @@ def agentic_snowflake_incident():
         llm_conn_id="pydanticai_default",
         model_id="anthropic:claude-sonnet-4-6",
     )
-    def investigate(ctx: dict) -> str:
+    def investigate(ctx: dict, prior_incidents: str) -> str:
         """Return the prompt for the agent based on the gathered context.
 
         This agent only has the SQL tool — it cannot create a Jira ticket or post to
@@ -148,6 +171,7 @@ def agentic_snowflake_incident():
         logs_section = "\n\n".join(
             f"=== {tid} ===\n{log}" for tid, log in ctx.get("task_logs", {}).items()
         )
+        prior_section = f"{prior_incidents}\n\n" if prior_incidents else ""
         return (
             f"{ctx['failed_dag_id']} has failed.\n"
             f"DAG run ID: {ctx['failed_dag_run_id']}\n"
@@ -155,8 +179,11 @@ def agentic_snowflake_incident():
             f"Task logs:\n{logs_section}\n\n"
             f"Pipeline source code ({ctx['failed_dag_id']}.py):\n"
             f"```python\n{ctx.get('dag_source', '')}\n```\n\n"
+            f"{prior_section}"
             "Investigation steps:\n"
-            "1. Read the pipeline source code above first. Identify exactly how each write/"
+            "1. If prior incidents are listed above, treat the most similar as your leading "
+            "hypothesis to CONFIRM or rule out against the evidence below — do not just accept it. "
+            "Read the pipeline source code above first. Identify exactly how each write/"
             "match/dedup key is constructed (e.g. is it a stable business key, or something "
             "regenerated fresh on every run?). Your root cause must be grounded in what the "
             "code actually does, not just inferred from the shape of the data — a plausible-"
@@ -217,6 +244,18 @@ def agentic_snowflake_incident():
         return ticket
 
     @task
+    def record_incident(diagnosis: str, failed_dag_id: str, failed_dag_run_id: str, ticket: dict) -> None:
+        """Record the resolved incident in memory, keyed by its Jira ticket (best-effort).
+
+        Runs after the ticket exists so the ticket key can be the record's stable identity. A later
+        close-sync can re-record the same key with status flipped to `closed` to update it in place.
+        Deterministic, like create_jira_ticket — not an agent decision, so it happens exactly once.
+        """
+        incident_memory.record_incident(
+            failed_dag_id, failed_dag_run_id, diagnosis, ticket, status="open"
+        )
+
+    @task
     def post_to_slack(diagnosis: str, failed_dag_id: str, ticket: dict) -> None:
         """Post the agent's diagnosis, with the Jira ticket link, to the Slack incident channel."""
         slack = SlackHook(slack_conn_id="slack_api")
@@ -241,8 +280,11 @@ def agentic_snowflake_incident():
         )
 
     ctx = gather_context()
-    diagnosis = investigate(ctx)
+    prior = recall_prior_incidents(ctx)
+    diagnosis = investigate(ctx, prior)
     ticket = create_jira_ticket(diagnosis, ctx["failed_dag_id"])
+    # record + slack both depend only on the ticket, so they run in parallel.
+    record_incident(diagnosis, ctx["failed_dag_id"], ctx["failed_dag_run_id"], ticket)
     post_to_slack(diagnosis, ctx["failed_dag_id"], ticket)
 
 

@@ -12,3 +12,5 @@ airflow.db
 .claude/
 .mcp.json
 keys/
+# RAG incident-memory index/ledger — local state, never commit
+include/.rag-incidents/
