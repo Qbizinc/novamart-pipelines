@@ -18,7 +18,7 @@ from airflow.providers.http.hooks.http import HttpHook
 
 
 def trigger_incident_dag(context) -> None:
-    """Task on_failure_callback — fires agentic_snowflake_incident via the Airflow REST API."""
+    """Task on_failure_callback — fires agentic_snowflake_incident_memory via the Airflow REST API."""
     try:
         conn = HttpHook(http_conn_id="airflow_api").get_connection("airflow_api")
         base_url = f"{conn.schema or 'http'}://{conn.host}:{conn.port or 8080}"
@@ -35,7 +35,7 @@ def trigger_incident_dag(context) -> None:
         run_id = dag_run.run_id if dag_run else "unknown"
         failed_dag_id = context["dag"].dag_id
         resp = requests.post(
-            f"{base_url}/api/v2/dags/agentic_snowflake_incident/dagRuns",
+            f"{base_url}/api/v2/dags/agentic_snowflake_incident_memory/dagRuns",
             json={
                 "dag_run_id": f"incident__{run_id}",
                 "logical_date": datetime.now(timezone.utc).isoformat(),

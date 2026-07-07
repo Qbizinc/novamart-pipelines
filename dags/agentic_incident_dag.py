@@ -286,7 +286,7 @@ def agentic_incident_dag():
 
         for _ in range(12):
             response = client.messages.create(
-                model="claude-sonnet-4-6",
+                model="claude-haiku-4-5",
                 max_tokens=2048,
                 system=system_prompt,
                 tools=AGENT_TOOLS,

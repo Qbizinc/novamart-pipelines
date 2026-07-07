@@ -1,0 +1,3 @@
+# git is required by pip to install the qbiz-rag-mcp package from a VCS URL
+# (requirements.txt) — the base Astro runtime image doesn't include it.
+git
