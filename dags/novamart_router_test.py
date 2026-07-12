@@ -7,11 +7,9 @@ Each stage can fail independently and realistically:
 
 1. fetch_from_api    — pulls a randomized batch of POS transactions from sales_api (mock-apis-repo).
                         Failure: toggle sales_api unhealthy -> real requests.Timeout.
-2. upload_to_s3       — writes the batch to S3 as JSON. Failure: NOVAMART_ROUTER_TEST_CODE_BUG=true
-                        -> a real KeyError from a deliberate bug in this file's own code (references
-                        a nonexistent "prices" field instead of "total_price") — not a config/
-                        credentials problem, for testing the FIX path (propose_code_fix / open_pr)
-                        rather than ESCALATE/TICKET.
+2. upload_to_s3       — writes the batch to S3 as JSON. Failure: NOVAMART_ROUTER_TEST_S3_ACCESS_DENIED=true
+                        -> a real botocore.exceptions.ClientError shaped as AccessDenied
+                        (synthetic — not a real bucket policy — but an authentic exception shape).
 3. download_from_s3   — reads the object back. Failure: NOVAMART_ROUTER_TEST_S3_ACCESS_DENIED=true
                         -> a real botocore.exceptions.ClientError shaped as AccessDenied
                         (synthetic — not a real bucket policy — but an authentic exception shape).
@@ -32,11 +30,9 @@ Required Airflow Variables:
 - MOCK_SALES_API_URL                     : sales_api base URL (default host.docker.internal:5001)
 - NOVAMART_S3_BUCKET                     : S3 bucket to read/write (real bucket, must already exist)
 - NOVAMART_ROUTER_TEST_S3_ACCESS_DENIED  : "true" to simulate AccessDenied on the S3 read
-- NOVAMART_ROUTER_TEST_CODE_BUG          : "true" to simulate a real bug in this pipeline's code
 
 **How to trigger each failure:**
 - API:        POST http://localhost:5001/toggle-error {"healthy": false}  (toggle back with true)
-- Code bug:   set NOVAMART_ROUTER_TEST_CODE_BUG=true                       (toggle back with false)
 - S3/IAM:     set NOVAMART_ROUTER_TEST_S3_ACCESS_DENIED=true               (toggle back with false)
 - Snowflake:  ALTER TABLE SANDBOX_DATA_PIPELINE.NOVAMART_RAW.ROUTER_TEST_ORDERS DROP COLUMN channel;
               (restore with: ALTER TABLE ... ADD COLUMN channel VARCHAR;)
@@ -82,13 +78,6 @@ def novamart_router_test():
     @task
     def upload_to_s3(transactions: list[dict]) -> None:
         """Write the fetched batch to S3 as JSON."""
-        if Variable.get("NOVAMART_ROUTER_TEST_CODE_BUG", default="false").lower() == "true":
-            # Deliberate bug (not a config/credentials problem): "prices" isn't a real field on
-            # a transaction — should be "total_price". A genuine bug in our own code, for testing
-            # the FIX path (propose_code_fix / open_pr) rather than ESCALATE/TICKET.
-            batch_value = sum(t["prices"] for t in transactions)
-            print(f"Batch value: {batch_value}")
-
         bucket = Variable.get("NOVAMART_S3_BUCKET")
         S3Hook(aws_conn_id="aws_default").load_string(
             string_data=json.dumps(transactions),
