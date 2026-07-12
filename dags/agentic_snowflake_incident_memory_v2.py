@@ -436,7 +436,7 @@ def agentic_snowflake_incident_memory_v2():
         pr_r.raise_for_status()
         pr = pr_r.json()
         print(f"[open_pr] Opened PR #{pr['number']}: {pr['html_url']}")
-        return {"url": pr["html_url"], "number": pr["number"]}
+        return {"url": pr["html_url"], "number": pr["number"], "title": pr["title"], "summary": summary}
 
     @task
     def notify_slack_fix(pr: dict, diagnosis: str, failed_dag_id: str) -> dict:
@@ -450,13 +450,21 @@ def agentic_snowflake_incident_memory_v2():
         if pr.get("url"):
             pr_line = f"  |  <{pr['url']}|PR #{pr.get('number')}>"
             headline = f":hammer_and_wrench: *NovaMart — {failed_dag_id} auto-fixed*{pr_line}{owner_mention}"
+            detail_lines = [f"*{pr.get('title', pr.get('summary', ''))}*"]
         else:
             headline = (
                 f":hammer_and_wrench: *NovaMart — {failed_dag_id} has a proposed code fix* "
                 f"(GitHub connection not configured yet — PR not opened){owner_mention}"
             )
+            detail_lines = []
 
         header_ts = slack.call("chat.postMessage", json={"channel": channel, "text": headline})["ts"]
+
+        if detail_lines:
+            slack.call(
+                "chat.postMessage",
+                json={"channel": channel, "text": "\n".join(detail_lines), "thread_ts": header_ts},
+            )
         slack.call(
             "chat.postMessage",
             json={"channel": channel, "text": f"```{diagnosis[:3800]}```", "thread_ts": header_ts},
