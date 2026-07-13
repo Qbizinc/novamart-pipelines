@@ -86,7 +86,7 @@ def novamart_router_test():
             # Deliberate bug (not a config/credentials problem): "prices" isn't a real field on
             # a transaction — should be "total_price". A genuine bug in our own code, for testing
             # the FIX path (propose_code_fix / open_pr) rather than ESCALATE/TICKET.
-            batch_value = sum(t["prices"] for t in transactions)
+            batch_value = sum(t["total_price"] for t in transactions)
             print(f"Batch value: {batch_value}")
 
         bucket = Variable.get("NOVAMART_S3_BUCKET")
