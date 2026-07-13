@@ -84,6 +84,23 @@ INSTRUCTIONS_DIR = "/usr/local/airflow/include/incident_instructions"
 GITHUB_REPO = "Qbizinc/novamart-pipelines"
 
 
+class ResilientHookToolset(HookToolset):
+    """A HookToolset that turns a tool call's own exception into an error string the agent can
+    reason about, instead of an uncaught exception that crashes the whole investigation.
+
+    This matters specifically for investigate_aws: when the actual incident IS an AWS auth/
+    credentials problem, the diagnostic tools built on the same connection fail the same way the
+    pipeline did. Without this, the agent can never diagnose "the AWS session is expired" — the
+    investigation itself would always crash first instead of observing and reporting that.
+    """
+
+    async def call_tool(self, name, tool_args, ctx, tool):
+        try:
+            return await super().call_tool(name, tool_args, ctx, tool)
+        except Exception as exc:
+            return f"ERROR calling tool {name!r}: {type(exc).__name__}: {exc}"
+
+
 def _load_instructions(platform: str) -> str:
     with open(os.path.join(INSTRUCTIONS_DIR, f"{platform}.md"), encoding="utf-8") as f:
         return f.read()
@@ -249,7 +266,7 @@ def agentic_snowflake_incident_memory_v2():
 
     @task.agent(
         toolsets=[
-            HookToolset(
+            ResilientHookToolset(
                 hook=S3Hook(aws_conn_id="aws_default"),
                 allowed_methods=["check_for_key", "list_keys", "read_key", "get_bucket_tagging"],
             ),

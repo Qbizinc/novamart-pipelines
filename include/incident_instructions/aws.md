@@ -15,6 +15,11 @@ Investigation steps for an **AWS** platform failure (S3, IAM, Secrets Manager):
 3. Use the S3 tool to check the actual state of the bucket/key in question (e.g. does the key
    exist, what does it currently contain, what tags does the bucket carry) — confirm your
    hypothesis against live state rather than the error message alone.
+   **If the tool call itself returns an error** (it won't raise — a failure comes back as an
+   `ERROR calling tool ...` string, same as any other tool result), that is itself diagnostic
+   evidence, not a dead end. In particular, if the tool fails with the *same* credentials/session
+   error as the original failure (e.g. `ExpiredToken`), that confirms a credentials/session
+   problem — you don't need the tool to succeed to reach that conclusion.
 4. Use that evidence to confirm (or rule out) the mechanism you identified in step 2.
 5. Return your findings as plain structured text, in exactly this format (this is the final
    answer — you have no other tools to call after this):

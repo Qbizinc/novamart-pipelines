@@ -64,7 +64,7 @@ S3_KEY = "router-test/orders.json"
     schedule=None,
     catchup=False,
     doc_md=__doc__,
-    tags=["novamart", "incident-demo", "router-test"],
+    tags=["novamart", "incident-demo", "router-test", "critical"],  # critical: escalate non-fixable failures
     default_args={"on_failure_callback": trigger_incident_dag_v2},
 )
 def novamart_router_test():
