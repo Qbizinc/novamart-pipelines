@@ -39,7 +39,7 @@ include/novamart_utils.py:trigger_incident_dag_v2), or manually from the UI.
                                  - urgent_slack_post: pipeline is critical AND the failure is NOT
                                    a code bug -> immediate tagged Slack alert, no ticket.
                                  - create_ticket_low_priority: not critical -> a normal-priority
-                                   backlog item, no Slack post.
+                                   Jira ticket, plus a quiet Slack FYI (no @mention) linking it.
 7. record_incident          — records the resolved incident in memory regardless of which path
                                ran (trigger_rule=none_failed_min_one_success).
 
@@ -78,7 +78,7 @@ from airflow.providers.common.ai.decorators import llm_branch as _llm_branch_dec
 from airflow.providers.common.ai.toolsets.hook import HookToolset
 from airflow.providers.common.ai.toolsets.sql import SQLToolset
 
-from include import incident_memory
+from include import diagnosis_format, harness_audit, incident_memory
 
 INSTRUCTIONS_DIR = "/usr/local/airflow/include/incident_instructions"
 GITHUB_REPO = "Qbizinc/novamart-pipelines"
@@ -358,18 +358,20 @@ def agentic_snowflake_incident_memory_v2():
         )
 
     @task
-    def open_pr(proposed_fix: str, failed_dag_id: str, failed_dag_run_id: str) -> dict:
-        """Open a PR on the human-approved fix via the GitHub REST API.
+    def validate_proposed_fix(proposed_fix: str, failed_dag_id: str, failed_dag_run_id: str) -> dict:
+        """Parse the agent's [SUMMARY]/[FILE_PATH]/[NEW_CONTENT] text into structured fields and
+        mechanically validate them before anything writes to the repo.
 
-        Deterministic — the agent only proposed content (and a human approved it via HITL
-        review); this task is the only thing that actually writes to the repo. Degrades to a
-        clear no-op if the github_api connection isn't configured yet.
+        Centralizing the parsing here (instead of inline in open_pr) means there is one place
+        that turns agent prose into structured data, and that structured data can be checked by
+        validate_output — checks on structured fields are non-bypassable in a way scraping raw
+        text is not. check_format's type check alone won't catch a present-but-empty
+        file_path/new_content (an empty string still satisfies `str`), so an explicit non-empty
+        check follows it — "content must be non-blank" is a domain rule the mechanical
+        shape-checker doesn't express.
         """
-        try:
-            conn = HttpHook(http_conn_id="github_api").get_connection("github_api")
-        except Exception:
-            print("[open_pr] github_api connection not configured — skipping PR creation.")
-            return {"url": None, "number": None}
+        incident_id = f"{failed_dag_id}:{failed_dag_run_id}"
+        audit = harness_audit.new_audit_log()
 
         summary = "Automated fix"
         file_path = None
@@ -384,8 +386,93 @@ def agentic_snowflake_incident_memory_v2():
             file_path = path_line.strip()
             new_content = after_content_marker.strip("\n")
 
-        if not file_path or not new_content:
-            raise ValueError("open_pr: could not parse [FILE_PATH]/[NEW_CONTENT] from proposed fix.")
+        parsed = {"summary": summary, "file_path": file_path or "", "new_content": new_content or ""}
+
+        harness_audit.guard_output(
+            audit,
+            response=parsed,
+            expected_schema={"summary": str, "file_path": str, "new_content": str},
+            action="validate_proposed_fix",
+            incident_id=incident_id,
+            job_id=failed_dag_run_id,
+        )
+        # Beyond "non-blank": the path must actually stay inside dags/ — mechanical validation
+        # doesn't know *which* file was supposed to be fixed, only that a write to an arbitrary
+        # repo path (or outside it, via "..") should never reach open_pr's GitHub API calls.
+        path_in_bounds = (
+            parsed["file_path"].startswith("dags/")
+            and ".." not in parsed["file_path"]
+        )
+        if not parsed["file_path"] or not parsed["new_content"] or not path_in_bounds:
+            from qbiz_harness import OutputRejectedError
+
+            reason = (
+                "file_path/new_content present but blank"
+                if (not parsed["file_path"] or not parsed["new_content"])
+                else f"file_path {parsed['file_path']!r} is outside dags/"
+            )
+            exc = OutputRejectedError(f"validate_proposed_fix: {reason}.")
+            audit.record_intervention(
+                agent_id=harness_audit.DAG_ID,
+                action="validate_proposed_fix",
+                component="output_validator",
+                prevented=str(exc),
+                incident_id=incident_id,
+                cohort=harness_audit.COHORT,
+                job_id=failed_dag_run_id,
+            )
+            raise exc
+
+        audit.record(
+            agent_id=harness_audit.DAG_ID,
+            action="validate_proposed_fix",
+            decision="allowed",
+            incident_id=incident_id,
+            cohort=harness_audit.COHORT,
+            job_id=failed_dag_run_id,
+            outputs={"summary": summary, "file_path": parsed["file_path"]},
+        )
+        return parsed
+
+    @task
+    def open_pr(validated_fix: dict, diagnosis: str, failed_dag_id: str, failed_dag_run_id: str) -> dict:
+        """Open a PR on the validated fix via the GitHub REST API.
+
+        Deterministic — the agent only proposed content (validated by validate_proposed_fix);
+        this task is the only thing that actually writes to the repo. Degrades to a clear no-op
+        if the github_api connection isn't configured yet.
+        """
+        incident_id = f"{failed_dag_id}:{failed_dag_run_id}"
+        audit = harness_audit.new_audit_log()
+
+        try:
+            conn = HttpHook(http_conn_id="github_api").get_connection("github_api")
+        except Exception:
+            print("[open_pr] github_api connection not configured — skipping PR creation.")
+            audit.record(
+                agent_id=harness_audit.DAG_ID,
+                action="open_pr",
+                decision="skipped",
+                incident_id=incident_id,
+                cohort=harness_audit.COHORT,
+                job_id=failed_dag_run_id,
+                outputs={"reason": "github_api connection not configured"},
+            )
+            return {"url": None, "number": None}
+
+        summary = validated_fix["summary"]
+        file_path = validated_fix["file_path"]
+        new_content = validated_fix["new_content"]
+
+        governor = harness_audit.new_action_governor({"prs_opened": 1})
+        harness_audit.guard_action(
+            governor,
+            audit,
+            kind="prs_opened",
+            action="open_pr",
+            incident_id=incident_id,
+            job_id=failed_dag_run_id,
+        )
 
         headers = {
             "Authorization": f"Bearer {conn.password}",
@@ -433,6 +520,12 @@ def agentic_snowflake_incident_memory_v2():
         )
         commit_r.raise_for_status()
 
+        pr_body = diagnosis_format.build_pr_body(
+            dag_id=failed_dag_id,
+            run_id=failed_dag_run_id,
+            sections=diagnosis_format.parse_diagnosis(diagnosis),
+            run_url=diagnosis_format.airflow_run_url(failed_dag_id, failed_dag_run_id),
+        )
         pr_r = requests.post(
             f"{base_url}/pulls",
             headers=headers,
@@ -441,103 +534,131 @@ def agentic_snowflake_incident_memory_v2():
                 "head": branch_name,
                 "base": default_branch,
                 "draft": True,
-                "body": (
-                    f"Automated fix proposed by agentic_snowflake_incident_memory_v2 for a "
-                    f"failure in `{failed_dag_id}` (run `{failed_dag_run_id}`).\n\n"
-                    f"**Unreviewed** — opened as a draft. Review the diff and mark ready for "
-                    f"review (or close it) before merging."
-                ),
+                "body": pr_body,
             },
             timeout=10,
         )
         pr_r.raise_for_status()
         pr = pr_r.json()
         print(f"[open_pr] Opened PR #{pr['number']}: {pr['html_url']}")
-        return {"url": pr["html_url"], "number": pr["number"], "title": pr["title"], "summary": summary}
+
+        try:
+            requests.post(
+                f"{base_url}/issues/{pr['number']}/labels",
+                headers=headers,
+                json={"labels": ["automated-fix"]},
+                timeout=10,
+            ).raise_for_status()
+        except Exception as exc:
+            # A missing/misnamed label on the repo shouldn't fail an otherwise-successful PR.
+            print(f"[open_pr] Could not apply 'automated-fix' label (continuing): {exc}")
+
+        result = {"url": pr["html_url"], "number": pr["number"], "title": pr["title"], "summary": summary}
+        audit.record(
+            agent_id=harness_audit.DAG_ID,
+            action="open_pr",
+            decision="allowed",
+            incident_id=incident_id,
+            cohort=harness_audit.COHORT,
+            job_id=failed_dag_run_id,
+            outputs={"url": result["url"], "number": result["number"]},
+        )
+        return result
 
     @task
-    def notify_slack_fix(pr: dict, diagnosis: str, failed_dag_id: str) -> dict:
+    def notify_slack_fix(pr: dict, diagnosis: str, failed_dag_id: str, failed_dag_run_id: str) -> dict:
         """Post to Slack that a PR was opened (or, if GitHub isn't configured yet, that one
         would have been). Returns pr unchanged so record_incident can link it."""
+        incident_id = f"{failed_dag_id}:{failed_dag_run_id}"
+        audit = harness_audit.new_audit_log()
+        governor = harness_audit.new_action_governor({"messages_sent": 5})
+
         slack = SlackHook(slack_conn_id="slack_api")
         channel = Variable.get("SLACK_INCIDENT_CHANNEL", default="#qbiz_slackbot_testing")
         owner_id = Variable.get("NOVAMART_INCIDENT_OWNER_SLACK_ID", default="")
-        owner_mention = f" <@{owner_id}>" if owner_id else ""
+        owner_mention = f"<@{owner_id}>" if owner_id else ""
 
+        sections = diagnosis_format.parse_diagnosis(diagnosis)
+        links = [("View the failed Airflow run", diagnosis_format.airflow_run_url(failed_dag_id, failed_dag_run_id))]
         if pr.get("url"):
-            pr_line = f"  |  <{pr['url']}|PR #{pr.get('number')}>"
-            headline = f":hammer_and_wrench: *NovaMart — {failed_dag_id} auto-fixed*{pr_line}{owner_mention}"
-            detail_lines = [f"*{pr.get('title', pr.get('summary', ''))}*"]
+            links.insert(0, (f"PR #{pr.get('number')}: {pr.get('title', pr.get('summary', ''))}", pr["url"]))
+            severity = "fix"
         else:
-            headline = (
-                f":hammer_and_wrench: *NovaMart — {failed_dag_id} has a proposed code fix* "
-                f"(GitHub connection not configured yet — PR not opened){owner_mention}"
-            )
-            detail_lines = []
+            severity = "fix"  # GitHub not configured — still the FIX path, just without a PR link
 
-        header_ts = slack.call("chat.postMessage", json={"channel": channel, "text": headline})["ts"]
+        blocks, fallback_text = diagnosis_format.build_incident_blocks(
+            severity=severity, dag_id=failed_dag_id, run_id=failed_dag_run_id,
+            sections=sections, owner_mention=owner_mention, links=links,
+        )
 
-        if detail_lines:
-            slack.call(
-                "chat.postMessage",
-                json={"channel": channel, "text": "\n".join(detail_lines), "thread_ts": header_ts},
-            )
-        slack.call(
-            "chat.postMessage",
-            json={"channel": channel, "text": f"```{diagnosis[:3800]}```", "thread_ts": header_ts},
+        harness_audit.guard_action(
+            governor, audit, kind="messages_sent", action="notify_slack_fix",
+            incident_id=incident_id, job_id=failed_dag_run_id,
+        )
+        slack.call("chat.postMessage", json={"channel": channel, "blocks": blocks, "text": fallback_text})
+        audit.record(
+            agent_id=harness_audit.DAG_ID, action="notify_slack_fix", decision="allowed",
+            incident_id=incident_id, cohort=harness_audit.COHORT, job_id=failed_dag_run_id,
+            outputs={"channel": channel, "pr_url": pr.get("url")},
         )
         return pr
 
     @task
-    def urgent_slack_post(diagnosis: str, failed_dag_id: str) -> None:
+    def urgent_slack_post(diagnosis: str, failed_dag_id: str, failed_dag_run_id: str) -> None:
         """Post an urgent, tagged Slack alert — no Jira ticket. Only for critical pipelines
         whose root cause is not a fixable code bug."""
+        incident_id = f"{failed_dag_id}:{failed_dag_run_id}"
+        audit = harness_audit.new_audit_log()
+        governor = harness_audit.new_action_governor({"messages_sent": 5})
+
         slack = SlackHook(slack_conn_id="slack_api")
         channel = Variable.get("SLACK_INCIDENT_CHANNEL", default="#qbiz_slackbot_testing")
         owner_id = Variable.get("NOVAMART_INCIDENT_OWNER_SLACK_ID", default="")
-        owner_mention = f" <@{owner_id}>" if owner_id else ""
+        owner_mention = f"<@{owner_id}>" if owner_id else ""
 
-        header_ts = slack.call(
-            "chat.postMessage",
-            json={
-                "channel": channel,
-                "text": (
-                    f":rotating_light::rotating_light: *CRITICAL — {failed_dag_id} Pipeline "
-                    f"Failure*{owner_mention}"
-                ),
-            },
-        )["ts"]
-        slack.call(
-            "chat.postMessage",
-            json={"channel": channel, "text": f"```{diagnosis[:3800]}```", "thread_ts": header_ts},
+        sections = diagnosis_format.parse_diagnosis(diagnosis)
+        links = [("View the failed Airflow run", diagnosis_format.airflow_run_url(failed_dag_id, failed_dag_run_id))]
+        blocks, fallback_text = diagnosis_format.build_incident_blocks(
+            severity="critical", dag_id=failed_dag_id, run_id=failed_dag_run_id,
+            sections=sections, owner_mention=owner_mention, links=links,
+        )
+
+        harness_audit.guard_action(
+            governor, audit, kind="messages_sent", action="urgent_slack_post",
+            incident_id=incident_id, job_id=failed_dag_run_id,
+        )
+        slack.call("chat.postMessage", json={"channel": channel, "blocks": blocks, "text": fallback_text})
+        audit.record(
+            agent_id=harness_audit.DAG_ID, action="urgent_slack_post", decision="allowed",
+            incident_id=incident_id, cohort=harness_audit.COHORT, job_id=failed_dag_run_id,
+            outputs={"channel": channel},
         )
 
     @task
-    def create_ticket_low_priority(diagnosis: str, failed_dag_id: str) -> dict:
-        """Create a low-priority Jira ticket — no Slack post. Only for non-critical pipelines."""
-        summary = f"[Low priority] {failed_dag_id} pipeline failure"
-        body = diagnosis
-        if diagnosis.startswith("[SUMMARY]"):
-            first_line, _, rest = diagnosis.partition("\n")
-            title = first_line.removeprefix("[SUMMARY]").strip() or f"{failed_dag_id} pipeline failure"
-            summary = f"[Low priority] {title}"
-            body = rest.strip()
-        body = f"(Low priority — non-critical pipeline)\n\n{body}"
+    def create_ticket_low_priority(diagnosis: str, failed_dag_id: str, failed_dag_run_id: str) -> dict:
+        """Create a low-priority Jira ticket, plus a quiet (no @mention) Slack FYI linking it.
+        Only for non-critical pipelines."""
+        incident_id = f"{failed_dag_id}:{failed_dag_run_id}"
+        audit = harness_audit.new_audit_log()
+        governor = harness_audit.new_action_governor({"tickets_created": 1, "messages_sent": 1})
 
+        sections = diagnosis_format.parse_diagnosis(diagnosis)
+        summary = f"[Low priority] {sections['summary'] or f'{failed_dag_id} pipeline failure'}"
+
+        harness_audit.guard_action(
+            governor, audit, kind="tickets_created", action="create_ticket_low_priority",
+            incident_id=incident_id, job_id=failed_dag_run_id,
+        )
         response = HttpHook(method="POST", http_conn_id="jira_api").run(
             endpoint="/rest/api/3/issue",
             data=json.dumps({
                 "fields": {
                     "project": {"key": "AD"},
                     "summary": summary,
-                    "description": {
-                        "type": "doc",
-                        "version": 1,
-                        "content": [
-                            {"type": "paragraph", "content": [{"type": "text", "text": body}]}
-                        ],
-                    },
+                    "description": diagnosis_format.build_adf_description(sections),
                     "issuetype": {"name": "Bug"},
+                    "priority": {"name": "Low"},
+                    "labels": ["automated", "incident-response"],
                 }
             }),
             headers={"Content-Type": "application/json"},
@@ -545,6 +666,29 @@ def agentic_snowflake_incident_memory_v2():
         data = response.json()
         ticket = {"key": data["key"], "url": f"https://qbizinc.atlassian.net/browse/{data['key']}"}
         print(f"[create_ticket_low_priority] Created {ticket['key']}: {ticket['url']}")
+
+        channel = Variable.get("SLACK_INCIDENT_CHANNEL", default="#qbiz_slackbot_testing")
+        links = [
+            (f"Jira ticket {ticket['key']}", ticket["url"]),
+            ("View the failed Airflow run", diagnosis_format.airflow_run_url(failed_dag_id, failed_dag_run_id)),
+        ]
+        blocks, fallback_text = diagnosis_format.build_incident_blocks(
+            severity="ticket", dag_id=failed_dag_id, run_id=failed_dag_run_id,
+            sections=sections, owner_mention="", links=links,
+        )
+        harness_audit.guard_action(
+            governor, audit, kind="messages_sent", action="create_ticket_low_priority",
+            incident_id=incident_id, job_id=failed_dag_run_id,
+        )
+        SlackHook(slack_conn_id="slack_api").call(
+            "chat.postMessage", json={"channel": channel, "blocks": blocks, "text": fallback_text}
+        )
+
+        audit.record(
+            agent_id=harness_audit.DAG_ID, action="create_ticket_low_priority", decision="allowed",
+            incident_id=incident_id, cohort=harness_audit.COHORT, job_id=failed_dag_run_id,
+            outputs={"ticket_key": ticket["key"], "ticket_url": ticket["url"]},
+        )
         return ticket
 
     @task(trigger_rule="none_failed_min_one_success")
@@ -568,6 +712,18 @@ def agentic_snowflake_incident_memory_v2():
             failed_dag_id, failed_dag_run_id, diagnosis, ticket_like, status="open"
         )
 
+        path = "fix" if (fix_result and fix_result.get("url")) else ("ticket" if ticket else "escalate")
+        audit = harness_audit.new_audit_log()
+        audit.record(
+            agent_id=harness_audit.DAG_ID,
+            action="record_incident",
+            decision="allowed",
+            incident_id=f"{failed_dag_id}:{failed_dag_run_id}",
+            cohort=harness_audit.COHORT,
+            job_id=failed_dag_run_id,
+            outputs={"path": path},
+        )
+
     ctx = gather_context()
     prior = recall_prior_incidents(ctx)
 
@@ -581,12 +737,13 @@ def agentic_snowflake_incident_memory_v2():
 
     decision = decide_path(diagnosis, ctx)
     proposed_fix = propose_code_fix(ctx, diagnosis)
-    escalate_done = urgent_slack_post(diagnosis, ctx["failed_dag_id"])
-    ticket = create_ticket_low_priority(diagnosis, ctx["failed_dag_id"])
+    escalate_done = urgent_slack_post(diagnosis, ctx["failed_dag_id"], ctx["failed_dag_run_id"])
+    ticket = create_ticket_low_priority(diagnosis, ctx["failed_dag_id"], ctx["failed_dag_run_id"])
     decision >> [proposed_fix, escalate_done, ticket]
 
-    pr = open_pr(proposed_fix, ctx["failed_dag_id"], ctx["failed_dag_run_id"])
-    fix_result = notify_slack_fix(pr, diagnosis, ctx["failed_dag_id"])
+    validated_fix = validate_proposed_fix(proposed_fix, ctx["failed_dag_id"], ctx["failed_dag_run_id"])
+    pr = open_pr(validated_fix, diagnosis, ctx["failed_dag_id"], ctx["failed_dag_run_id"])
+    fix_result = notify_slack_fix(pr, diagnosis, ctx["failed_dag_id"], ctx["failed_dag_run_id"])
 
     record_incident(
         diagnosis, ctx["failed_dag_id"], ctx["failed_dag_run_id"], fix_result, ticket, escalate_done

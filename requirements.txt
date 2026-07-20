@@ -15,3 +15,8 @@ sqlglot
 # engine needs updating. The base package is engine-only (numpy + fastembed): no `mcp` runtime
 # in the image.
 qbiz-rag-mcp @ git+https://github.com/Qbizinc/qbiz-agents.git@09e1f065cf3098cb5c5f6a0766cf99d0be953049#subdirectory=mcp/mcp_rag
+
+# Harness: code-enforced action caps + audit trail + output validation for the incident-response
+# DAG's consequential actions (Slack/Jira/GitHub writes). Pinned to a commit SHA on qbiz-agents
+# master for the same reason as qbiz-rag-mcp above.
+qbiz-agent-harness @ git+https://github.com/Qbizinc/qbiz-agents.git@fb64ce93d5aac8676ca57e4029d7cf5ecaa9c864#subdirectory=harness

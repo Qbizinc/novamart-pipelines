@@ -145,6 +145,21 @@ SEED_INCIDENTS: list[dict] = [
             "not a production setting."
         ),
     },
+    {
+        "dag_id": "demo_one_api_escalate",
+        "key": "AD-1003",
+        "status": "closed",
+        "text": (
+            "[SUMMARY] demo_one_api_escalate failed — sales_api request timed out\n"
+            "[DIAGNOSIS] fetch_from_api raised requests.exceptions.Timeout calling sales_api's "
+            "/api/v1/sales endpoint.\n"
+            "[ROOT CAUSE] sales_api was unresponsive/overloaded at the time of the request; not a "
+            "bug in this pipeline's own code.\n"
+            "[IMPACT] No transactions fetched for this run; downstream load did not occur.\n"
+            "[RECOMMENDED FIX] Confirm sales_api's health/capacity with its owning team; retry the "
+            "run once it recovers. No code change needed in this pipeline."
+        ),
+    },
 ]
 
 

@@ -14,3 +14,5 @@ airflow.db
 keys/
 # RAG incident-memory index/ledger — local state, never commit
 include/.rag-incidents/
+# Harness audit trail — local state, never commit
+include/.harness-audit/
