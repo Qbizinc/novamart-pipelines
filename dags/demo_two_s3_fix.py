@@ -54,7 +54,7 @@ def demo_two_s3_fix():
         """Write a synthetic batch of transactions to S3. Always fails first."""
         # Deliberate bug: "totall_price" isn't a real field — should be "total_price". A genuine
         # bug in our own code, for testing the FIX path (propose_code_fix / open_pr).
-        batch_value = sum(t["totall_price"] for t in SAMPLE_TRANSACTIONS)
+        batch_value = sum(t["total_price"] for t in SAMPLE_TRANSACTIONS)
         print(f"Batch value: {batch_value}")
 
         bucket = Variable.get("NOVAMART_S3_BUCKET")
