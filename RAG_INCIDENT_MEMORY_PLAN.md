@@ -20,7 +20,7 @@ RAG engine actually drop into a client project?
 ## What we're integrating with (grounded map)
 
 **Trigger chain:** a pipeline DAG fails → `on_failure_callback = trigger_incident_dag`
-([`include/novamart_utils.py`](include/novamart_utils.py)) → fires `agentic_snowflake_incident` via
+([`include/incident_callbacks.py`](include/incident_callbacks.py)) → fires `agentic_snowflake_incident` via
 the Airflow REST API with `conf={failed_dag_id, failed_dag_run_id}`.
 
 **`agentic_snowflake_incident`** ([`dags/agentic_snowflake_incident.py`](dags/agentic_snowflake_incident.py)) — the polished, Jira-wired path:

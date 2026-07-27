@@ -37,7 +37,7 @@ from datetime import datetime
 from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
 from airflow.sdk import Variable, dag, task
 
-from include.novamart_utils import trigger_incident_dag
+from include.incident_callbacks import trigger_incident_dag
 
 MAX_EXPECTED_DAILY_ROWS = 500
 

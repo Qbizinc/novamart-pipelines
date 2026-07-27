@@ -38,7 +38,7 @@ from airflow.providers.http.hooks.http import HttpHook
 from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
 from airflow.sdk import dag, task
 
-from include.novamart_utils import trigger_incident_dag
+from include.incident_callbacks import trigger_incident_dag
 
 
 @dag(

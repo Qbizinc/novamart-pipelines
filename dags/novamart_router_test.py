@@ -2,7 +2,7 @@
 ## NovaMart Router Test — AI Triage Router Prototype Target
 
 A real 3-stage ETL pipeline (API -> S3 -> Snowflake) built to exercise
-agentic_snowflake_incident_memory_v2's platform-classification routing (aws / api / snowflake).
+agentic_incident_memory_v2's platform-classification routing (aws / api / snowflake).
 Each stage can fail independently and realistically:
 
 1. fetch_from_api    — pulls a randomized batch of POS transactions from sales_api (mock-apis-repo).
@@ -20,7 +20,7 @@ Each stage can fail independently and realistically:
                         `ALTER TABLE ROUTER_TEST_ORDERS DROP COLUMN channel;` in Snowflake first
                         -> a real Snowflake ProgrammingError (column count mismatch).
 
-On any failure this DAG triggers agentic_snowflake_incident_memory_v2 (not the original
+On any failure this DAG triggers agentic_incident_memory_v2 (not the original
 agentic_snowflake_incident_memory) via trigger_incident_dag_v2.
 
 Required Airflow Connections (set in airflow_settings.yaml):
@@ -50,7 +50,7 @@ from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
 from airflow.sdk import Variable, dag, task
 from botocore.exceptions import ClientError
 
-from include.novamart_utils import trigger_incident_dag_v2
+from include.incident_callbacks import trigger_incident_dag_v2
 
 import requests
 

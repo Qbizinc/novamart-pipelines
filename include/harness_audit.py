@@ -1,4 +1,4 @@
-"""Harness wiring for agentic_snowflake_incident_memory_v2's consequential actions — Slack posts,
+"""Harness wiring for agentic_incident_memory_v2's consequential actions — Slack posts,
 Jira ticket creation, GitHub PR opening. Uses qbiz_harness (CostGovernor + AuditLog +
 validate_output) as a plain library, same pattern as include/incident_memory.py.
 
@@ -15,7 +15,7 @@ multi-host store.
 from __future__ import annotations
 
 AUDIT_LOG_PATH = "/usr/local/airflow/include/.harness-audit/audit.jsonl"
-DAG_ID = "agentic_snowflake_incident_memory_v2"
+DAG_ID = "agentic_incident_memory_v2"
 COHORT = "novamart"
 
 # CostGovernor requires token/spend limits even when a task only uses the action-count dimension.

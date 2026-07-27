@@ -39,7 +39,7 @@ import requests
 from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
 from airflow.sdk import Variable, dag, task
 
-from include.novamart_utils import trigger_incident_dag
+from include.incident_callbacks import trigger_incident_dag
 
 TRANSACTIONS_API_DEFAULT = "http://host.docker.internal:5004"
 MAX_ACCEPTABLE_NULL_RATE = 0.10

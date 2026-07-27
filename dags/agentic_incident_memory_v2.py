@@ -1,5 +1,5 @@
 """
-## Agentic Snowflake Incident DAG v2 (platform + path routed, with incident memory)
+## Agentic Incident DAG v2 (platform + path routed, with incident memory)
 
 A standalone variant of agentic_snowflake_incident_memory that routes both investigation (by
 platform) and response (by severity) instead of using one fixed diagnose-then-ticket flow for
@@ -8,7 +8,7 @@ untouched; this is a separate, independently triggerable pipeline used to protot
 design.
 
 Triggered automatically when a pipeline's on_failure_callback points at this DAG (see
-include/novamart_utils.py:trigger_incident_dag_v2), or manually from the UI.
+include/incident_callbacks.py:trigger_incident_dag_v2), or manually from the UI.
 
 ### Flow
 1. gather_context           — pre-fetch failed task logs + pipeline source via the Airflow REST
@@ -21,9 +21,11 @@ include/novamart_utils.py:trigger_incident_dag_v2), or manually from the UI.
                                (include/incident_instructions/<platform>.md) and which toolset apply
                                — not what action to take on the result.
 4. investigate_<platform>   — @task.agent, platform-specific toolset:
-                                 - snowflake: SQLToolset(db_conn_id="snowflake_default")
-                                 - aws:       HookToolset over S3Hook (list_keys/read_key/etc.)
+                                 - snowflake: SQLToolset(db_conn_id="snowflake_default") + get_dag_source
+                                 - aws:       HookToolset over S3Hook (list_keys/read_key/etc.) + get_dag_source
                                  - api:       no live tool yet — reasons from logs/source only
+                               get_dag_source (FunctionToolset) fetches ANY DAG's source by dag_id, not
+                               just the one that failed — for tracing a root cause to an upstream pipeline.
                                Only one of these three actually runs per DAG run; the other two are
                                skipped by classify_platform.
 5. merge_diagnosis          — picks whichever of the three produced a diagnosis (trigger_rule=
@@ -77,6 +79,7 @@ from airflow.providers.common.ai.decorators import agent as _agent_decorator  # 
 from airflow.providers.common.ai.decorators import llm_branch as _llm_branch_decorator  # noqa: F401
 from airflow.providers.common.ai.toolsets.hook import HookToolset
 from airflow.providers.common.ai.toolsets.sql import SQLToolset
+from pydantic_ai.toolsets.function import FunctionToolset
 
 from include import diagnosis_format, harness_audit, incident_memory
 
@@ -101,12 +104,40 @@ class ResilientHookToolset(HookToolset):
             return f"ERROR calling tool {name!r}: {type(exc).__name__}: {exc}"
 
 
+class ResilientSQLToolset(SQLToolset):
+    async def call_tool(self, name, tool_args, ctx, tool):
+        try:
+            return await super().call_tool(name, tool_args, ctx, tool)
+        except Exception as exc:
+            return f"ERROR calling tool {name!r}: {type(exc).__name__}: {exc}"
+
+
 def _load_instructions(platform: str) -> str:
     with open(os.path.join(INSTRUCTIONS_DIR, f"{platform}.md"), encoding="utf-8") as f:
         return f.read()
 
 
-def _build_investigation_prompt(ctx: dict, prior_incidents: str, platform: str) -> str:
+def get_dag_source(dag_id: str) -> str:
+    """Fetch the Python source code of any Airflow DAG by its dag_id — not just the DAG that
+    failed. Use this to inspect an upstream/related pipeline when the evidence points there."""
+    conn = HttpHook(http_conn_id="airflow_api").get_connection("airflow_api")
+    base_url = f"{conn.schema or 'http'}://{conn.host}:{conn.port or 8080}"
+    token_r = requests.post(
+        f"{base_url}/auth/token",
+        json={"username": conn.login, "password": conn.password},
+        timeout=10,
+    )
+    token_r.raise_for_status()
+    headers = {"Authorization": f"Bearer {token_r.json()['access_token']}"}
+    r = requests.get(f"{base_url}/api/v2/dagSources/{dag_id}", headers=headers, timeout=10)
+    r.raise_for_status()
+    return r.json().get("content", "")
+
+
+dag_lookup_toolset = FunctionToolset(tools=[get_dag_source])
+
+
+def _build_investigation_prompt(ctx: dict, prior_incidents: dict, platform: str) -> str:
     """Shared prompt scaffolding for all three investigate_* agents — context + platform-specific
     instructions loaded from include/incident_instructions/<platform>.md."""
     tasks_summary = "\n".join(
@@ -115,7 +146,8 @@ def _build_investigation_prompt(ctx: dict, prior_incidents: str, platform: str) 
     logs_section = "\n\n".join(
         f"=== {tid} ===\n{log}" for tid, log in ctx.get("task_logs", {}).items()
     )
-    prior_section = f"{prior_incidents}\n\n" if prior_incidents else ""
+    prior_text = prior_incidents.get("text", "")
+    prior_section = f"{prior_text}\n\n" if prior_text else ""
     return (
         f"{ctx['failed_dag_id']} has failed.\n"
         f"DAG run ID: {ctx['failed_dag_run_id']}\n"
@@ -129,14 +161,14 @@ def _build_investigation_prompt(ctx: dict, prior_incidents: str, platform: str) 
 
 
 @dag(
-    dag_id="agentic_snowflake_incident_memory_v2",
+    dag_id="agentic_incident_memory_v2",
     start_date=datetime(2026, 1, 1),
     schedule=None,
     catchup=False,
     doc_md=__doc__,
     tags=["novamart", "agentic", "incident", "snowflake", "incident-memory", "router"],
 )
-def agentic_snowflake_incident_memory_v2():
+def agentic_incident_memory_v2():
 
     @task
     def gather_context(dag_run=None) -> dict:
@@ -224,12 +256,13 @@ def agentic_snowflake_incident_memory_v2():
         }
 
     @task
-    def recall_prior_incidents(ctx: dict) -> str:
+    def recall_prior_incidents(ctx: dict) -> dict:
         """Search incident memory for prior occurrences on this pipeline (recurrence detection).
 
         Deterministic pre-fetch: runs before investigation and feeds any matches into its prompt so
         the recurrence context is guaranteed present without relying on the agent to look it up.
-        Returns an empty string when there's no prior history (or if the memory is unavailable).
+        Returns {"text": ..., "tickets": [...]}, both empty when there's no prior history (or if
+        the memory is unavailable).
         """
         return incident_memory.recall_similar_incidents(
             ctx["failed_dag_id"], ctx.get("task_logs", {})
@@ -270,11 +303,12 @@ def agentic_snowflake_incident_memory_v2():
                 hook=S3Hook(aws_conn_id="aws_default"),
                 allowed_methods=["check_for_key", "list_keys", "read_key", "get_bucket_tagging"],
             ),
+            dag_lookup_toolset,
         ],
         llm_conn_id="pydanticai_default",
         model_id="anthropic:claude-haiku-4-5",
     )
-    def investigate_aws(ctx: dict, prior_incidents: str) -> str:
+    def investigate_aws(ctx: dict, prior_incidents: dict) -> str:
         """Diagnose an AWS (S3/IAM) platform failure. Only runs when classify_platform routes here."""
         return _build_investigation_prompt(ctx, prior_incidents, "aws")
 
@@ -283,18 +317,19 @@ def agentic_snowflake_incident_memory_v2():
         llm_conn_id="pydanticai_default",
         model_id="anthropic:claude-haiku-4-5",
     )
-    def investigate_api(ctx: dict, prior_incidents: str) -> str:
+    def investigate_api(ctx: dict, prior_incidents: dict) -> str:
         """Diagnose an upstream API platform failure. Only runs when classify_platform routes here."""
         return _build_investigation_prompt(ctx, prior_incidents, "api")
 
     @task.agent(
         toolsets=[
-            SQLToolset(db_conn_id="snowflake_default"),
+            ResilientSQLToolset(db_conn_id="snowflake_default"),
+            dag_lookup_toolset,
         ],
         llm_conn_id="pydanticai_default",
         model_id="anthropic:claude-haiku-4-5",
     )
-    def investigate_snowflake(ctx: dict, prior_incidents: str) -> str:
+    def investigate_snowflake(ctx: dict, prior_incidents: dict) -> str:
         """Diagnose a Snowflake platform failure. Only runs when classify_platform routes here."""
         return _build_investigation_prompt(ctx, prior_incidents, "snowflake")
 
@@ -604,7 +639,7 @@ def agentic_snowflake_incident_memory_v2():
         return pr
 
     @task
-    def urgent_slack_post(diagnosis: str, failed_dag_id: str, failed_dag_run_id: str) -> None:
+    def urgent_slack_post(diagnosis: str, failed_dag_id: str, failed_dag_run_id: str, prior_incidents: dict) -> None:
         """Post an urgent, tagged Slack alert — no Jira ticket. Only for critical pipelines
         whose root cause is not a fixable code bug."""
         incident_id = f"{failed_dag_id}:{failed_dag_run_id}"
@@ -621,6 +656,7 @@ def agentic_snowflake_incident_memory_v2():
         blocks, fallback_text = diagnosis_format.build_incident_blocks(
             severity="critical", dag_id=failed_dag_id, run_id=failed_dag_run_id,
             sections=sections, owner_mention=owner_mention, links=links,
+            prior_tickets=prior_incidents.get("tickets", []),
         )
 
         harness_audit.guard_action(
@@ -635,7 +671,7 @@ def agentic_snowflake_incident_memory_v2():
         )
 
     @task
-    def create_ticket_low_priority(diagnosis: str, failed_dag_id: str, failed_dag_run_id: str) -> dict:
+    def create_ticket_low_priority(diagnosis: str, failed_dag_id: str, failed_dag_run_id: str, prior_incidents: dict) -> dict:
         """Create a low-priority Jira ticket, plus a quiet (no @mention) Slack FYI linking it.
         Only for non-critical pipelines."""
         incident_id = f"{failed_dag_id}:{failed_dag_run_id}"
@@ -675,6 +711,7 @@ def agentic_snowflake_incident_memory_v2():
         blocks, fallback_text = diagnosis_format.build_incident_blocks(
             severity="ticket", dag_id=failed_dag_id, run_id=failed_dag_run_id,
             sections=sections, owner_mention="", links=links,
+            prior_tickets=prior_incidents.get("tickets", []),
         )
         harness_audit.guard_action(
             governor, audit, kind="messages_sent", action="create_ticket_low_priority",
@@ -737,8 +774,8 @@ def agentic_snowflake_incident_memory_v2():
 
     decision = decide_path(diagnosis, ctx)
     proposed_fix = propose_code_fix(ctx, diagnosis)
-    escalate_done = urgent_slack_post(diagnosis, ctx["failed_dag_id"], ctx["failed_dag_run_id"])
-    ticket = create_ticket_low_priority(diagnosis, ctx["failed_dag_id"], ctx["failed_dag_run_id"])
+    escalate_done = urgent_slack_post(diagnosis, ctx["failed_dag_id"], ctx["failed_dag_run_id"], prior)
+    ticket = create_ticket_low_priority(diagnosis, ctx["failed_dag_id"], ctx["failed_dag_run_id"], prior)
     decision >> [proposed_fix, escalate_done, ticket]
 
     validated_fix = validate_proposed_fix(proposed_fix, ctx["failed_dag_id"], ctx["failed_dag_run_id"])
@@ -750,4 +787,4 @@ def agentic_snowflake_incident_memory_v2():
     )
 
 
-agentic_snowflake_incident_memory_v2()
+agentic_incident_memory_v2()

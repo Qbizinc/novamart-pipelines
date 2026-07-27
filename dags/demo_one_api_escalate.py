@@ -10,7 +10,7 @@ Seeded with one prior incident (see include/incident_memory.py's SEED_INCIDENTS 
 novamart_incident_memory_seed DAG once) so recall_prior_incidents finds a real semantic match on
 the very first real run, instead of demoing an empty-memory pipeline.
 
-On any failure this DAG triggers agentic_snowflake_incident_memory_v2 via trigger_incident_dag_v2.
+On any failure this DAG triggers agentic_incident_memory_v2 via trigger_incident_dag_v2.
 
 Required Airflow Connections: airflow_api (used by the failure callback).
 
@@ -22,7 +22,7 @@ from datetime import datetime
 import requests
 from airflow.sdk import dag, task
 
-from include.novamart_utils import trigger_incident_dag_v2
+from include.incident_callbacks import trigger_incident_dag_v2
 
 
 @dag(

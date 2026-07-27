@@ -8,7 +8,7 @@ a bug introduced by this pipeline's own code. This DAG is deliberately NOT tagge
 decide_path routes to create_ticket_low_priority (a Jira ticket + a quiet, non-@mention Slack
 FYI), never to a PR or an urgent page.
 
-On any failure this DAG triggers agentic_snowflake_incident_memory_v2 via trigger_incident_dag_v2.
+On any failure this DAG triggers agentic_incident_memory_v2 via trigger_incident_dag_v2.
 
 Required Airflow Connections: snowflake_default (key-pair auth), airflow_api (used by the failure
 callback).
@@ -23,7 +23,7 @@ from datetime import datetime
 from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
 from airflow.sdk import dag, task
 
-from include.novamart_utils import trigger_incident_dag_v2
+from include.incident_callbacks import trigger_incident_dag_v2
 
 SAMPLE_ORDERS = [
     ("O-2001", 54.00, "east"),

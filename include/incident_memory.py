@@ -39,11 +39,11 @@ def _symptom_from_logs(task_logs: dict[str, str]) -> str:
     return " ".join(tails)[:1500].strip()
 
 
-def recall_similar_incidents(dag_id: str, task_logs: dict[str, str], k: int = 3) -> str:
+def recall_similar_incidents(dag_id: str, task_logs: dict[str, str], k: int = 3) -> dict:
     """Search incident memory for prior occurrences on this pipeline.
 
-    Returns a prompt-ready section (empty string if there are no matches or on any error, so the
-    investigation proceeds normally).
+    Returns {"text": prompt-ready section, "tickets": [ticket keys]} — both empty if there are no
+    matches or on any error, so the investigation proceeds normally.
     """
     try:
         symptom = _symptom_from_logs(task_logs)
@@ -53,11 +53,11 @@ def recall_similar_incidents(dag_id: str, task_logs: dict[str, str], k: int = 3)
         hits = _index().search(f"{dag_id} {symptom}".strip(), k=k, tags=[dag_id])
     except Exception as exc:  # best-effort — never block the investigation
         print(f"[incident_memory] recall failed (continuing without prior context): {exc}")
-        return ""
+        return {"text": "", "tickets": []}
 
     if not hits:
         print(f"[incident_memory] no prior incidents on record for {dag_id}")
-        return ""
+        return {"text": "", "tickets": []}
 
     print(f"[incident_memory] {len(hits)} prior incident(s) for {dag_id}: "
           f"{[h.get('title') for h in hits]}")
@@ -70,7 +70,8 @@ def recall_similar_incidents(dag_id: str, task_logs: dict[str, str], k: int = 3)
             f"\n--- {h.get('title', '?')} (similarity {h.get('score', 0.0):.2f}) ---\n"
             f"{(h.get('text') or '').strip()[:800]}"
         )
-    return "\n".join(lines)
+    tickets = [h["title"] for h in hits if h.get("title")]
+    return {"text": "\n".join(lines), "tickets": tickets}
 
 
 def build_record(dag_id: str, run_id: str, diagnosis: str, ticket: dict) -> str:
@@ -158,6 +159,26 @@ SEED_INCIDENTS: list[dict] = [
             "[IMPACT] No transactions fetched for this run; downstream load did not occur.\n"
             "[RECOMMENDED FIX] Confirm sales_api's health/capacity with its owning team; retry the "
             "run once it recovers. No code change needed in this pipeline."
+        ),
+    },
+    {
+        "dag_id": "demo_3_gold_sales_by_region",
+        "key": "AD-1004",
+        "status": "closed",
+        "text": (
+            "[SUMMARY] demo_3_gold_sales_by_region failed — SUM() error on a column expected to be numeric\n"
+            "[DIAGNOSIS] The gold aggregation task failed running SUM() over a column sourced from "
+            "SILVER_SALES; the column held non-numeric text instead of the numeric type it was "
+            "defined with.\n"
+            "[ROOT CAUSE] BRONZE_SALES's column was VARCHAR holding non-numeric text, not the numeric "
+            "type demo_1_bronze_sales's code defines — a discrepancy between declared and observed "
+            "schema. demo_2_silver_sales rebuilds SILVER_SALES via `SELECT *` with no explicit "
+            "column list, so it carried that discrepancy straight through without erroring itself — "
+            "the break only surfaced downstream, at the gold aggregation.\n"
+            "[IMPACT] GOLD_SALES_BY_REGION was not refreshed for the affected run.\n"
+            "[RECOMMENDED FIX] Compare BRONZE_SALES's current column types/sample values against "
+            "what demo_1_bronze_sales defines, focusing on whatever column the failing aggregation "
+            "uses. Rebuild BRONZE_SALES with that column restored to its correct numeric type."
         ),
     },
 ]

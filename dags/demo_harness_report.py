@@ -1,7 +1,7 @@
 """
 ## Demo Harness Report — human-readable summary of the harness audit trail
 
-Reads include/.harness-audit/audit.jsonl (written by agentic_snowflake_incident_memory_v2's
+Reads include/.harness-audit/audit.jsonl (written by agentic_incident_memory_v2's
 harness-guarded tasks — see include/harness_audit.py) and prints a readable report to this task's
 log: every incident recorded so far, grouped in order, showing every guarded action's outcome and
 every harness intervention (a cost-governor cap or output-validator rejection that actually

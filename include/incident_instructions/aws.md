@@ -21,6 +21,10 @@ Investigation steps for an **AWS** platform failure (S3, IAM, Secrets Manager):
    error as the original failure (e.g. `ExpiredToken`), that confirms a credentials/session
    problem — you don't need the tool to succeed to reach that conclusion.
 4. Use that evidence to confirm (or rule out) the mechanism you identified in step 2.
+   If the evidence (a file path, key prefix, or log reference) implicates a different pipeline
+   than the one that failed — e.g. this pipeline only consumes what another DAG produced — use
+   get_dag_source to fetch that DAG's own source and verify the actual defect there before
+   naming it as the root cause. Don't name a specific upstream defect you haven't actually read.
 5. Return your findings as plain structured text, in exactly this format (this is the final
    answer — you have no other tools to call after this):
    ```

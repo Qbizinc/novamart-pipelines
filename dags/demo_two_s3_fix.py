@@ -11,7 +11,7 @@ Not tagged critical (doesn't matter for this path) and has no seeded prior incid
 recall_prior_incidents naturally returns nothing on this pipeline — demonstrating a fresh-memory
 diagnosis, in contrast to demo_one_api_escalate's seeded recall.
 
-On any failure this DAG triggers agentic_snowflake_incident_memory_v2 via trigger_incident_dag_v2.
+On any failure this DAG triggers agentic_incident_memory_v2 via trigger_incident_dag_v2.
 
 Required Airflow Connections: aws_default (S3), airflow_api (used by the failure callback).
 Required Airflow Variables:
@@ -26,7 +26,7 @@ from datetime import datetime
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 from airflow.sdk import Variable, dag, task
 
-from include.novamart_utils import trigger_incident_dag_v2
+from include.incident_callbacks import trigger_incident_dag_v2
 
 S3_KEY = "demo-two/orders.json"
 

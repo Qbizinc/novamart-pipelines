@@ -50,7 +50,7 @@ def trigger_incident_dag(context) -> None:
 
 
 def trigger_incident_dag_v2(context) -> None:
-    """Task on_failure_callback — fires agentic_snowflake_incident_memory_v2 (router prototype)."""
+    """Task on_failure_callback — fires agentic_incident_memory_v2 (router prototype)."""
     try:
         conn = HttpHook(http_conn_id="airflow_api").get_connection("airflow_api")
         base_url = f"{conn.schema or 'http'}://{conn.host}:{conn.port or 8080}"
@@ -67,7 +67,7 @@ def trigger_incident_dag_v2(context) -> None:
         run_id = dag_run.run_id if dag_run else "unknown"
         failed_dag_id = context["dag"].dag_id
         resp = requests.post(
-            f"{base_url}/api/v2/dags/agentic_snowflake_incident_memory_v2/dagRuns",
+            f"{base_url}/api/v2/dags/agentic_incident_memory_v2/dagRuns",
             json={
                 "dag_run_id": f"incident__{run_id}",
                 "logical_date": datetime.now(timezone.utc).isoformat(),

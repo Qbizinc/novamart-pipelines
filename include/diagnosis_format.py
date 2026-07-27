@@ -85,6 +85,7 @@ def build_incident_blocks(
     sections: dict[str, str],
     owner_mention: str = "",
     links: list[tuple[str, str]] | None = None,
+    prior_tickets: list[str] | None = None,
 ) -> tuple[list[dict], str]:
     """Build a Slack Block Kit payload for one incident notification.
 
@@ -115,6 +116,9 @@ def build_incident_blocks(
         blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"*Recommended fix:*\n{sections['recommended_fix']}"}})
     if not sections.get("root_cause") and not sections.get("recommended_fix") and sections.get("diagnosis"):
         blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"*Diagnosis:*\n{sections['diagnosis']}"}})
+
+    if prior_tickets:
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"*Seen before:* {', '.join(prior_tickets)}"}})
 
     for text, url in (links or []):
         blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"<{url}|{text}>"}})
@@ -157,6 +161,6 @@ def build_pr_body(*, dag_id: str, run_id: str, sections: dict[str, str], run_url
         f"- Pipeline: `{dag_id}`\n"
         f"- Triggering run: `{run_id}`\n"
         f"- [View the failed Airflow run]({run_url})\n\n"
-        f"**⚠️ Unreviewed** — opened as a draft by `agentic_snowflake_incident_memory_v2`. "
+        f"**⚠️ Unreviewed** — opened as a draft by `agentic_incident_memory_v2`. "
         f"Review the diff and mark ready for review (or close it) before merging."
     )

@@ -157,7 +157,7 @@ def agentic_snowflake_incident_memory():
         """
         return incident_memory.recall_similar_incidents(
             ctx["failed_dag_id"], ctx.get("task_logs", {})
-        )
+        ).get("text", "")
 
     @task.agent(
         toolsets=[

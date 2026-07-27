@@ -42,7 +42,7 @@ from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
 from airflow.sdk import Variable, dag, task
 
-from include.novamart_utils import trigger_incident_dag
+from include.incident_callbacks import trigger_incident_dag
 
 SKUS = ["SKU-001", "SKU-002", "SKU-003", "SKU-004", "SKU-005"]
 UPSTREAM_KEY = "upstream-drops/daily_sales.csv"
