@@ -36,7 +36,6 @@ def demo_4_transactions_csv():
     @task
     def write_csv_and_manifest(transactions: list[dict]) -> None:
         business_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        source_record_count = len(transactions)
 
         groups: dict[tuple[str, str], dict] = {}
         for t in transactions:
@@ -50,6 +49,8 @@ def demo_4_transactions_csv():
             })
             g["quantity"] += t["quantity"]
             g["total_price"] += t["total_price"]
+
+        source_record_count = len(groups)
 
         header = "transaction_id,sku,channel,quantity,total_price,business_date"
         lines = [header]
