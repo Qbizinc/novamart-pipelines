@@ -1,3 +1,4 @@
+```python
 """Demo 5 — Load Transactions + QA. Loads demo_4's CSV into Snowflake; QA-gates on row count vs. manifest."""
 
 import csv
@@ -100,3 +101,4 @@ def demo_5_load_transactions_qa():
 
 
 demo_5_load_transactions_qa()
+```
