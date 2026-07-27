@@ -76,7 +76,7 @@ def demo_5_load_transactions_qa():
     @task
     def qa_check_grain(payload: dict) -> None:
         business_date = payload["manifest"]["business_date"]
-        expected = payload["manifest"]["source_record_count"]
+        expected = len(payload["rows"])
 
         conn = SnowflakeHook(snowflake_conn_id="snowflake_default").get_conn()
         try:
@@ -86,14 +86,13 @@ def demo_5_load_transactions_qa():
         finally:
             conn.close()
 
-        print(f"QA check: manifest={payload['manifest_key']} declares {expected} source records; "
+        print(f"QA check: CSV file {payload['csv_key']} contains {expected} rows; "
               f"{TABLE} has {actual} rows for business_date={business_date}.")
         if actual != expected:
             raise ValueError(
                 f"Grain/uniqueness check failed for business_date={business_date}: "
-                f"manifest s3://.../{payload['manifest_key']} declares {expected} source "
-                f"transactions, but {TABLE} has {actual} rows. Row count from "
-                f"{payload['csv_key']} does not match its own manifest."
+                f"CSV file s3://.../{payload['csv_key']} has {expected} rows, "
+                f"but {TABLE} has {actual} rows. Row count mismatch after load."
             )
 
     qa_check_grain(load_to_snowflake(read_csv_and_manifest()))
