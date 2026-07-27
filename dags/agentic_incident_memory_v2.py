@@ -390,7 +390,14 @@ def agentic_incident_memory_v2():
             print(f"[check_cross_pipeline_reference] could not list dags (continuing without check): {exc}")
             return ""
 
-        mentioned = [d for d in all_dag_ids if d != failed_dag_id and d in diagnosis]
+        # Match on word boundaries, not raw substring: a dag_id that is a prefix of another
+        # (demo_1 vs demo_1_bronze_sales) would otherwise report a cross-pipeline reference that
+        # the diagnosis never made. \b treats underscores as word chars, so the longer id doesn't
+        # match the shorter one.
+        mentioned = [
+            d for d in all_dag_ids
+            if d != failed_dag_id and re.search(rf"\b{re.escape(d)}\b", diagnosis)
+        ]
         if not mentioned:
             return ""
         note = (
@@ -841,7 +848,11 @@ def agentic_incident_memory_v2():
             failed_dag_id, failed_dag_run_id, diagnosis, ticket_like, status="open"
         )
 
-        path = "fix" if (fix_result and fix_result.get("url")) else ("ticket" if ticket else "escalate")
+        # Which branch ran is decided by which XCom is non-None (skipped tasks yield None) — NOT by
+        # whether a PR URL came back. open_pr degrades to {"url": None} when github_api isn't
+        # configured, and keying off the URL would mislabel that still-took-the-fix-path run as an
+        # escalation in the audit trail.
+        path = "fix" if fix_result is not None else ("ticket" if ticket else "escalate")
         audit = harness_audit.new_audit_log()
         audit.record(
             agent_id=harness_audit.DAG_ID,
