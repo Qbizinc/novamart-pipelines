@@ -20,7 +20,19 @@ Investigation steps for a **Snowflake** platform failure:
    If the evidence (a file path, table name, or log reference) implicates a different pipeline
    than the one that failed — e.g. this pipeline only consumes what another DAG produced — use
    get_dag_source to fetch that DAG's own source and verify the actual defect there before
-   naming it as the root cause. Don't name a specific upstream defect you haven't actually read.
+   naming it as the root cause. If you're not sure of its exact dag_id, call list_dag_ids first
+   rather than guessing a name. Don't name a specific upstream defect you haven't actually read.
+   When a check compares two numbers/values that disagree (e.g. a manifest/count vs. actual
+   rows), don't just recommend making them match — figure out which one reflects the pipeline's
+   intended behavior (read the code that produced each value) and recommend fixing whichever side
+   is actually wrong. Never recommend weakening, removing, or working around the check itself
+   (a validation/QA/uniqueness/grain check) to make it stop firing — it exists to catch exactly
+   this kind of problem and is doing its job correctly.
+   To judge which side is actually wrong, look for internal inconsistencies within the suspect
+   code itself, not just which value looks more "official": e.g. a field that should identify one
+   specific record (an id, a key) but is populated from a group/aggregation of several records is
+   a sign that the aggregation was not the intended design — the identity field only makes sense
+   at the finer grain. Ground your conclusion in a concrete inconsistency like this, not a guess.
 5. Return your findings as plain structured text, in exactly this format (this is the final
    answer — you have no other tools to call after this):
    ```

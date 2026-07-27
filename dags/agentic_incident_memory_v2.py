@@ -21,11 +21,12 @@ include/incident_callbacks.py:trigger_incident_dag_v2), or manually from the UI.
                                (include/incident_instructions/<platform>.md) and which toolset apply
                                — not what action to take on the result.
 4. investigate_<platform>   — @task.agent, platform-specific toolset:
-                                 - snowflake: SQLToolset(db_conn_id="snowflake_default") + get_dag_source
-                                 - aws:       HookToolset over S3Hook (list_keys/read_key/etc.) + get_dag_source
+                                 - snowflake: SQLToolset(db_conn_id="snowflake_default") + dag_lookup_toolset
+                                 - aws:       HookToolset over S3Hook (list_keys/read_key/etc.) + dag_lookup_toolset
                                  - api:       no live tool yet — reasons from logs/source only
-                               get_dag_source (FunctionToolset) fetches ANY DAG's source by dag_id, not
-                               just the one that failed — for tracing a root cause to an upstream pipeline.
+                               dag_lookup_toolset (FunctionToolset: list_dag_ids, get_dag_source) lets the
+                               agent find and fetch ANY DAG's source by dag_id, not just the one that
+                               failed — for tracing a root cause to an upstream pipeline.
                                Only one of these three actually runs per DAG run; the other two are
                                skipped by classify_platform.
 5. merge_diagnosis          — picks whichever of the three produced a diagnosis (trigger_rule=
@@ -66,6 +67,7 @@ include/incident_callbacks.py:trigger_incident_dag_v2), or manually from the UI.
 import base64
 import json
 import os
+import re
 from datetime import datetime
 
 import requests
@@ -117,24 +119,50 @@ def _load_instructions(platform: str) -> str:
         return f.read()
 
 
-def get_dag_source(dag_id: str) -> str:
-    """Fetch the Python source code of any Airflow DAG by its dag_id — not just the DAG that
-    failed. Use this to inspect an upstream/related pipeline when the evidence points there."""
+def _airflow_api_headers(base_url: str) -> dict:
     conn = HttpHook(http_conn_id="airflow_api").get_connection("airflow_api")
-    base_url = f"{conn.schema or 'http'}://{conn.host}:{conn.port or 8080}"
     token_r = requests.post(
         f"{base_url}/auth/token",
         json={"username": conn.login, "password": conn.password},
         timeout=10,
     )
     token_r.raise_for_status()
-    headers = {"Authorization": f"Bearer {token_r.json()['access_token']}"}
-    r = requests.get(f"{base_url}/api/v2/dagSources/{dag_id}", headers=headers, timeout=10)
-    r.raise_for_status()
-    return r.json().get("content", "")
+    return {"Authorization": f"Bearer {token_r.json()['access_token']}"}
 
 
-dag_lookup_toolset = FunctionToolset(tools=[get_dag_source])
+def _airflow_api_base_url() -> str:
+    conn = HttpHook(http_conn_id="airflow_api").get_connection("airflow_api")
+    return f"{conn.schema or 'http'}://{conn.host}:{conn.port or 8080}"
+
+
+def list_dag_ids() -> list[str] | str:
+    """List every known dag_id in this Airflow instance. Use this to find the exact dag_id of a
+    suspected upstream/related pipeline before calling get_dag_source."""
+    try:
+        base_url = _airflow_api_base_url()
+        headers = _airflow_api_headers(base_url)
+        r = requests.get(f"{base_url}/api/v2/dags", headers=headers, timeout=10)
+        r.raise_for_status()
+        return [d["dag_id"] for d in r.json().get("dags", [])]
+    except Exception as exc:
+        return f"ERROR listing dags: {type(exc).__name__}: {exc}"
+
+
+def get_dag_source(dag_id: str) -> str:
+    """Fetch the Python source code of any Airflow DAG by its dag_id — not just the DAG that
+    failed. Use this to inspect an upstream/related pipeline when the evidence points there.
+    If the exact dag_id isn't known, call list_dag_ids first."""
+    try:
+        base_url = _airflow_api_base_url()
+        headers = _airflow_api_headers(base_url)
+        r = requests.get(f"{base_url}/api/v2/dagSources/{dag_id}", headers=headers, timeout=10)
+        r.raise_for_status()
+        return r.json().get("content", "")
+    except Exception as exc:
+        return f"ERROR fetching source for dag_id={dag_id!r}: {type(exc).__name__}: {exc}"
+
+
+dag_lookup_toolset = FunctionToolset(tools=[get_dag_source, list_dag_ids])
 
 
 def _build_investigation_prompt(ctx: dict, prior_incidents: dict, platform: str) -> str:
@@ -327,7 +355,7 @@ def agentic_incident_memory_v2():
             dag_lookup_toolset,
         ],
         llm_conn_id="pydanticai_default",
-        model_id="anthropic:claude-haiku-4-5",
+        model_id="anthropic:claude-sonnet-5",
     )
     def investigate_snowflake(ctx: dict, prior_incidents: dict) -> str:
         """Diagnose a Snowflake platform failure. Only runs when classify_platform routes here."""
@@ -346,34 +374,76 @@ def agentic_incident_memory_v2():
                 return diagnosis
         raise ValueError("merge_diagnosis: no platform investigation produced a diagnosis.")
 
+    @task
+    def check_cross_pipeline_reference(diagnosis: str, ctx: dict) -> str:
+        """Deterministically check whether the diagnosis text names a dag_id other than the one
+        that actually failed, so decide_path gets an explicit fact instead of having to notice
+        it itself by reading two loosely related blocks of prose."""
+        failed_dag_id = ctx["failed_dag_id"]
+        try:
+            base_url = _airflow_api_base_url()
+            headers = _airflow_api_headers(base_url)
+            r = requests.get(f"{base_url}/api/v2/dags", headers=headers, timeout=10)
+            r.raise_for_status()
+            all_dag_ids = [d["dag_id"] for d in r.json().get("dags", [])]
+        except Exception as exc:
+            print(f"[check_cross_pipeline_reference] could not list dags (continuing without check): {exc}")
+            return ""
+
+        mentioned = [d for d in all_dag_ids if d != failed_dag_id and d in diagnosis]
+        if not mentioned:
+            return ""
+        note = (
+            f"AUTOMATED CHECK (not an opinion, a fact): this diagnosis text mentions the "
+            f"following OTHER pipeline(s), distinct from the one that actually failed "
+            f"({failed_dag_id}): {', '.join(mentioned)}. If the root cause is a genuine code bug "
+            f"in one of those pipelines, propose_code_fix can still apply — but it must fetch "
+            f"that pipeline's REAL source via get_dag_source before proposing any change to it, "
+            f"and the FILE_PATH must point to that pipeline's actual file, not {failed_dag_id}'s."
+        )
+        print(f"[check_cross_pipeline_reference] {note}")
+        return note
+
     @task.llm_branch(
         llm_conn_id="pydanticai_default",
-        model_id="anthropic:claude-haiku-4-5",
+        model_id="anthropic:claude-sonnet-5",
         system_prompt=(
             "Decide how to respond to this diagnosed pipeline failure. Choose exactly one:\n"
-            "- propose_code_fix: the root cause is a genuine bug in the pipeline's OWN code (e.g. "
-            "a typo, wrong dict/field key, wrong type handling) that can be safely corrected by "
-            "editing that code — NOT a credentials, permissions, or external-service problem.\n"
-            "- urgent_slack_post: the pipeline is marked CRITICAL and the root cause is NOT a code "
-            "bug (e.g. expired credentials, access denied, an upstream service down, external "
-            "schema drift) — needs a human's immediate attention right now, not a queued ticket.\n"
+            "- propose_code_fix: the root cause is a genuine, fixable bug in a pipeline's OWN "
+            "code (e.g. a typo, wrong dict/field key, wrong type handling, an unintended "
+            "aggregation) — NOT a credentials, permissions, or external-service problem. This "
+            "can be the pipeline named as 'Pipeline:' below, OR a different pipeline it depends "
+            "on (e.g. an upstream producer), if the diagnosis traced the defect to that "
+            "pipeline's own code — propose_code_fix has a tool to fetch and fix that other "
+            "pipeline's real file too, it is not limited to editing only the failed pipeline. "
+            "NOT eligible for propose_code_fix, regardless of which pipeline: a fix that would "
+            "weaken, remove, or work around a validation/QA/uniqueness/grain check to make the "
+            "failure stop, rather than fixing what the check correctly caught — that check is "
+            "doing its job; if the only available 'fix' is loosening the check, this is not a "
+            "fixable code bug, route to urgent_slack_post/create_ticket_low_priority instead.\n"
+            "- urgent_slack_post: the pipeline is marked CRITICAL and the root cause is NOT a "
+            "fixable code bug (e.g. expired credentials, access denied, an upstream service down, "
+            "external schema drift, or a fix that would require weakening a QA check) — needs a "
+            "human's immediate attention right now, not a queued ticket.\n"
             "- create_ticket_low_priority: everything else — the pipeline is not critical, so this "
             "can be tracked as a normal backlog item instead of paging anyone.\n"
             "Route to exactly one of these three tasks."
         ),
     )
-    def decide_path(diagnosis: str, ctx: dict) -> str:
+    def decide_path(diagnosis: str, ctx: dict, cross_ref_note: str) -> str:
         """Return the prompt for the fix/escalate/ticket branch decision."""
         criticality = "CRITICAL pipeline" if ctx.get("is_critical") else "not marked critical"
-        return f"Pipeline: {ctx['failed_dag_id']} ({criticality})\n\nDiagnosis:\n{diagnosis}"
+        note_section = f"\n\n{cross_ref_note}" if cross_ref_note else ""
+        return f"Pipeline: {ctx['failed_dag_id']} ({criticality})\n\nDiagnosis:\n{diagnosis}{note_section}"
 
     @task.agent(
-        toolsets=[],
+        toolsets=[dag_lookup_toolset],
         llm_conn_id="pydanticai_default",
-        model_id="anthropic:claude-haiku-4-5",
+        model_id="anthropic:claude-sonnet-5",
     )
     def propose_code_fix(ctx: dict, diagnosis: str) -> str:
-        """Propose a corrected version of the failing file's source.
+        """Propose a corrected version of whichever file actually contains the bug — which may
+        be a different pipeline than the one that failed.
 
         Review happens on the resulting GitHub PR itself (opened as a draft by open_pr, with a
         Slack notification), not via an Airflow-side approval gate — a PR is easily discarded/
@@ -381,11 +451,28 @@ def agentic_incident_memory_v2():
         Airflow's HITL panel.
         """
         return (
-            f"The pipeline {ctx['failed_dag_id']} failed due to a bug in its own source code.\n\n"
+            f"{ctx['failed_dag_id']} failed.\n\n"
             f"Diagnosis:\n{diagnosis}\n\n"
-            f"Current source ({ctx['failed_dag_id']}.py):\n"
+            f"Source of the pipeline that failed ({ctx['failed_dag_id']}.py):\n"
             f"```python\n{ctx.get('dag_source', '')}\n```\n\n"
-            "Return the corrected file, in exactly this format (this is the final answer):\n"
+            "The bug may be in this file, or — if the diagnosis traces the root cause to a "
+            "different pipeline (e.g. an upstream producer) — in that pipeline's own file "
+            "instead. If so, use list_dag_ids/get_dag_source to fetch that pipeline's REAL "
+            "current source before proposing anything against it. Never invent or guess file "
+            "content you have not actually fetched.\n\n"
+            "Do not weaken, remove, or work around any validation/QA/uniqueness/grain check "
+            "(any assertion, raise, or comparison that gates data quality) to make the failure "
+            "stop. Those checks exist to catch real problems. If two values are expected to "
+            "match and don't, fix whichever side's logic actually produces the wrong value — "
+            "do not just change the reported/metadata value to match the wrong one. To judge "
+            "which side is wrong, look for internal inconsistencies in the suspect code itself: "
+            "e.g. a field that should identify one specific record (an id, a key) but is "
+            "populated from a group/aggregation of several records is a sign the aggregation "
+            "was not the intended design.\n\n"
+            f"[FILE_PATH] must be the path of whichever file actually contains the bug — this "
+            f"may or may not be {ctx['failed_dag_id']}.py.\n\n"
+            "Return the corrected file, in exactly this format (this is the final answer). "
+            "[FILE_PATH] must contain ONLY the path, nothing else on that line:\n"
             "[SUMMARY] one-line description of the fix\n"
             "[FILE_PATH] dags/<filename>.py\n"
             "[NEW_CONTENT]\n"
@@ -418,8 +505,13 @@ def agentic_incident_memory_v2():
         if "[FILE_PATH]" in body_text and "[NEW_CONTENT]" in body_text:
             _, _, after_path = body_text.partition("[FILE_PATH]")
             path_line, _, after_content_marker = after_path.partition("[NEW_CONTENT]")
-            file_path = path_line.strip()
-            new_content = after_content_marker.strip("\n")
+            # Keep only a well-formed path token, in case the model appends stray prose after it
+            # (e.g. an explanatory clause) on the same line.
+            path_match = re.match(r"\s*([\w\-./]+\.py)", path_line)
+            file_path = path_match.group(1) if path_match else path_line.strip()
+            new_content = re.sub(
+                r"\A```[a-zA-Z]*\n|\n```\s*\Z", "", after_content_marker.strip("\n")
+            )
 
         parsed = {"summary": summary, "file_path": file_path or "", "new_content": new_content or ""}
 
@@ -771,8 +863,9 @@ def agentic_incident_memory_v2():
     classification >> [diag_aws, diag_api, diag_snowflake]
 
     diagnosis = merge_diagnosis(diag_aws, diag_api, diag_snowflake)
+    cross_ref_note = check_cross_pipeline_reference(diagnosis, ctx)
 
-    decision = decide_path(diagnosis, ctx)
+    decision = decide_path(diagnosis, ctx, cross_ref_note)
     proposed_fix = propose_code_fix(ctx, diagnosis)
     escalate_done = urgent_slack_post(diagnosis, ctx["failed_dag_id"], ctx["failed_dag_run_id"], prior)
     ticket = create_ticket_low_priority(diagnosis, ctx["failed_dag_id"], ctx["failed_dag_run_id"], prior)
