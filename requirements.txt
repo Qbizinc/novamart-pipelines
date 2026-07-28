@@ -19,4 +19,4 @@ qbiz-rag-mcp @ git+https://github.com/Qbizinc/qbiz-agents.git@09e1f065cf3098cb5c
 # Harness: code-enforced action caps + audit trail + output validation for the incident-response
 # DAG's consequential actions (Slack/Jira/GitHub writes). Pinned to a commit SHA on qbiz-agents
 # master for the same reason as qbiz-rag-mcp above.
-qbiz-agent-harness @ git+https://github.com/Qbizinc/qbiz-agents.git@fb64ce93d5aac8676ca57e4029d7cf5ecaa9c864#subdirectory=harness
+qbiz-agent-harness @ git+https://github.com/Qbizinc/qbiz-agents.git@557caaf4b135b814f49eb2e28b2d9036d3ffcbf2#subdirectory=harness

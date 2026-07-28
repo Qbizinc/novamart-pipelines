@@ -88,6 +88,20 @@ from include import diagnosis_format, harness_audit, incident_memory
 INSTRUCTIONS_DIR = "/usr/local/airflow/include/incident_instructions"
 GITHUB_REPO = "Qbizinc/novamart-pipelines"
 
+# The only two models this DAG's agent/branch steps are allowed to use — see
+# harness_audit.new_model_policy() for which activity is capped/floored at which tier, and why.
+MODEL_WEAK = "anthropic:claude-haiku-4-5"
+MODEL_FRONTIER = "anthropic:claude-sonnet-5"
+
+harness_audit.enforce_model_policy({
+    "classify_platform": MODEL_WEAK,
+    "investigate_aws": MODEL_WEAK,
+    "investigate_api": MODEL_WEAK,
+    "investigate_snowflake": MODEL_FRONTIER,
+    "decide_path": MODEL_FRONTIER,
+    "propose_code_fix": MODEL_FRONTIER,
+})
+
 
 class ResilientHookToolset(HookToolset):
     """A HookToolset that turns a tool call's own exception into an error string the agent can
@@ -298,7 +312,7 @@ def agentic_incident_memory_v2():
 
     @task.llm_branch(
         llm_conn_id="pydanticai_default",
-        model_id="anthropic:claude-haiku-4-5",
+        model_id=MODEL_WEAK,
         system_prompt=(
             "You are triaging a data pipeline failure. Classify which platform the failure "
             "belongs to, based on the failed task's exception text. Choose exactly one:\n"
@@ -334,7 +348,7 @@ def agentic_incident_memory_v2():
             dag_lookup_toolset,
         ],
         llm_conn_id="pydanticai_default",
-        model_id="anthropic:claude-haiku-4-5",
+        model_id=MODEL_WEAK,
     )
     def investigate_aws(ctx: dict, prior_incidents: dict) -> str:
         """Diagnose an AWS (S3/IAM) platform failure. Only runs when classify_platform routes here."""
@@ -343,7 +357,7 @@ def agentic_incident_memory_v2():
     @task.agent(
         toolsets=[],
         llm_conn_id="pydanticai_default",
-        model_id="anthropic:claude-haiku-4-5",
+        model_id=MODEL_WEAK,
     )
     def investigate_api(ctx: dict, prior_incidents: dict) -> str:
         """Diagnose an upstream API platform failure. Only runs when classify_platform routes here."""
@@ -355,7 +369,7 @@ def agentic_incident_memory_v2():
             dag_lookup_toolset,
         ],
         llm_conn_id="pydanticai_default",
-        model_id="anthropic:claude-sonnet-5",
+        model_id=MODEL_FRONTIER,
     )
     def investigate_snowflake(ctx: dict, prior_incidents: dict) -> str:
         """Diagnose a Snowflake platform failure. Only runs when classify_platform routes here."""
@@ -413,7 +427,7 @@ def agentic_incident_memory_v2():
 
     @task.llm_branch(
         llm_conn_id="pydanticai_default",
-        model_id="anthropic:claude-sonnet-5",
+        model_id=MODEL_FRONTIER,
         system_prompt=(
             "Decide how to respond to this diagnosed pipeline failure. Choose exactly one:\n"
             "- propose_code_fix: the root cause is a genuine, fixable bug in a pipeline's OWN "
@@ -446,7 +460,7 @@ def agentic_incident_memory_v2():
     @task.agent(
         toolsets=[dag_lookup_toolset],
         llm_conn_id="pydanticai_default",
-        model_id="anthropic:claude-sonnet-5",
+        model_id=MODEL_FRONTIER,
     )
     def propose_code_fix(ctx: dict, diagnosis: str) -> str:
         """Propose a corrected version of whichever file actually contains the bug — which may

@@ -88,3 +88,42 @@ def guard_output(audit, *, response, expected_schema: dict, action: str, inciden
         )
         raise
     return response
+
+
+def new_model_policy():
+    """Build the model-tier policy for this DAG's agent/branch steps.
+
+    Unlike the other constructors here, this is meant to be called at DAG *parse* time (see
+    agentic_incident_memory_v2.py's module-level enforce_model_policy() call) — a model-tier
+    violation should fail DAG parsing outright, not wait for a task to run. That is a deliberate
+    exception to this module's usual "qbiz_harness only loads at task execution" rule.
+
+    classify_platform/investigate_aws/investigate_api are cheap triage/classification steps and
+    are capped at WEAK on purpose (cost control — a trivial step shouldn't self-escalate).
+    investigate_snowflake/decide_path/propose_code_fix are hard-floored at FRONTIER: this session
+    found by direct experiment that a WEAK model on these steps finds the right evidence and then
+    reasons past it anyway (see git history) — that floor is evidence-backed, not a preference.
+    """
+    from qbiz_harness import ActivityBand, ModelPolicy, Tier
+
+    tier_map = {
+        "anthropic:claude-haiku-4-5": Tier.WEAK,
+        "anthropic:claude-sonnet-5": Tier.FRONTIER,
+    }
+    activities = {
+        "classify_platform": ActivityBand(max_tier=Tier.WEAK),
+        "investigate_aws": ActivityBand(max_tier=Tier.WEAK),
+        "investigate_api": ActivityBand(max_tier=Tier.WEAK),
+        "investigate_snowflake": ActivityBand(max_tier=Tier.FRONTIER, min_tier=Tier.FRONTIER, floor_hard=True),
+        "decide_path": ActivityBand(max_tier=Tier.FRONTIER, min_tier=Tier.FRONTIER, floor_hard=True),
+        "propose_code_fix": ActivityBand(max_tier=Tier.FRONTIER, min_tier=Tier.FRONTIER, floor_hard=True),
+    }
+    return ModelPolicy(tier_map=tier_map, activities=activities)
+
+
+def enforce_model_policy(model_by_activity: dict[str, str]) -> None:
+    """Check every activity's configured model against the policy; raises ModelPolicyError on
+    the first violation. Called at DAG parse time, not per-task — see new_model_policy()."""
+    policy = new_model_policy()
+    for activity, model in model_by_activity.items():
+        policy.check(activity, model)
