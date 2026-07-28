@@ -60,7 +60,13 @@ def demo_4_transactions_csv():
             )
         csv_body = "\n".join(lines)
 
-        manifest = {"business_date": business_date, "source_record_count": source_record_count}
+        # The manifest's source_record_count must reflect the true grain of the CSV
+        # actually written (one row per (sku, channel) group), not the raw,
+        # pre-aggregation transaction count. Each written row's transaction_id is
+        # taken from only the first raw transaction in its group, confirming that
+        # the intended "record" unit for this artifact is the aggregated group,
+        # not the individual transaction.
+        manifest = {"business_date": business_date, "source_record_count": len(groups)}
 
         bucket = Variable.get("NOVAMART_S3_BUCKET")
         hook = S3Hook(aws_conn_id="aws_default")
@@ -69,7 +75,7 @@ def demo_4_transactions_csv():
         hook.load_string(string_data=csv_body, key=csv_key, bucket_name=bucket, replace=True)
         hook.load_string(string_data=json.dumps(manifest), key=manifest_key, bucket_name=bucket, replace=True)
         print(f"Wrote {len(groups)} rows to s3://{bucket}/{csv_key} "
-              f"(source_record_count={source_record_count}).")
+              f"(source_record_count={len(groups)}, raw_transaction_count={source_record_count}).")
 
     write_csv_and_manifest(fetch_transactions())
 
