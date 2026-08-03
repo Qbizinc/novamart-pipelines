@@ -1,0 +1,115 @@
+// NovaMart Pipelines — Tech Stack
+// Render with Graphviz: `dot -Tpng TECH_STACK.dot -o TECH_STACK.png`
+// or paste into https://dreampuf.github.io/GraphvizOnline/ / VS Code's Graphviz extension / Kroki.
+
+digraph tech_stack {
+    rankdir=TB;
+    fontname="Helvetica";
+    node [fontname="Helvetica", fontsize=11, shape=box, style="rounded,filled", color="#888888"];
+    edge [fontname="Helvetica", fontsize=9, color="#666666"];
+    compound=true;
+
+    // ---------------- Local Dev ----------------
+    subgraph cluster_dev {
+        label="Local Dev Environment";
+        style="rounded"; color="#7a7a7a"; fontsize=13; fontcolor="#444444";
+
+        astro   [label="Astro CLI\n(astro dev start / restart)", fillcolor="#eef1f5"];
+        docker  [label="Docker Desktop\nscheduler · dag-processor\ntriggerer · api-server · postgres", fillcolor="#eef1f5"];
+        awscli  [label="AWS CLI\nIAM user + MFA -> STS session token\n(refreshed hourly)", fillcolor="#eef1f5"];
+
+        astro -> docker;
+    }
+
+    // ---------------- Airflow ----------------
+    subgraph cluster_airflow {
+        label="Apache Airflow (Astro Runtime)";
+        style="rounded"; color="#3f6f9e"; fontsize=13; fontcolor="#1c3a54";
+
+        dags       [label="DAGs\ndemo_1..6, novamart_*,\nagentic_incident_memory_v2", fillcolor="#e5edf4"];
+        providers  [label="Airflow providers\ncommon-ai[anthropic]\n(@task.agent / @task.llm_branch)\nsnowflake · amazon · slack", fillcolor="#e5edf4"];
+
+        dags -> providers;
+    }
+    docker -> dags [lhead=cluster_airflow, label="hosts", style=dashed];
+
+    // ---------------- AI / Agent Layer ----------------
+    subgraph cluster_ai {
+        label="AI / Agent Layer";
+        style="rounded"; color="#b5762c"; fontsize=13; fontcolor="#6e4519";
+
+        pydanticai [label="pydantic-ai\n(agent runtime)", fillcolor="#f3e9d8"];
+        claude     [label="Anthropic Claude\nhaiku-4-5 (WEAK)\nsonnet-5 (FRONTIER)", fillcolor="#f3e9d8"];
+        harness    [label="qbiz_harness\n(repo: Qbizinc/qbiz-agents, pinned SHA)\nModelPolicy · CostGovernor\nOutputValidator · AuditLog", fillcolor="#f3e9d8"];
+
+        pydanticai -> claude;
+    }
+    providers -> pydanticai;
+    dags -> harness [label="guarded by", style=dashed, color="#b5762c"];
+
+    // ---------------- Incident Memory (RAG) ----------------
+    subgraph cluster_rag {
+        label="Incident Memory (RAG)";
+        style="rounded"; color="#4f8f5b"; fontsize=13; fontcolor="#2e5636";
+
+        ragmcp    [label="qbiz-rag-mcp\n(repo: Qbizinc/qbiz-agents, pinned SHA)", fillcolor="#e7f1e8"];
+        fastembed [label="fastembed\nBAAI/bge-small-en-v1.5", fillcolor="#e7f1e8"];
+        ragstore  [label="local index\ninclude/.rag-incidents\n(vectors.npy · chunks.jsonl · ledger.json)", shape=cylinder, fillcolor="#e7f1e8"];
+
+        ragmcp -> fastembed;
+        ragmcp -> ragstore;
+    }
+    dags -> ragmcp;
+
+    // ---------------- Data Plane ----------------
+    subgraph cluster_data {
+        label="Data Plane";
+        style="rounded"; color="#555555"; fontsize=13; fontcolor="#333333";
+
+        snowflake [label="Snowflake\nSANDBOX_DATA_PIPELINE.NOVAMART_RAW\n(key-pair auth)", shape=cylinder, fillcolor="#eeeeee"];
+        s3        [label="AWS S3\nqbiz-airflow-summit-2026\n(STS session, MFA-backed)", shape=cylinder, fillcolor="#eeeeee"];
+    }
+    providers -> snowflake;
+    providers -> s3;
+
+    // ---------------- Mock Data Sources ----------------
+    subgraph cluster_mock {
+        label="Mock Data Sources";
+        style="rounded"; color="#9a6fa0"; fontsize=13; fontcolor="#5c3f60";
+
+        mockapi [label="mock-apis-repo (Docker)\nsales_api · customer_api · marketing_api", fillcolor="#f1e7f2"];
+    }
+    dags -> mockapi;
+
+    // ---------------- Outward Integrations ----------------
+    subgraph cluster_out {
+        label="Outward Integrations (incident response)";
+        style="rounded"; color="#c1503f"; fontsize=13; fontcolor="#7a3226";
+
+        slackapi  [label="Slack\n(bot token, chat.postMessage)", fillcolor="#f6e6e3"];
+        jiraapi   [label="Jira REST API\nqbizinc.atlassian.net", fillcolor="#f6e6e3"];
+        githubapi [label="GitHub REST API\ndraft PRs on\nQbizinc/novamart-pipelines", fillcolor="#f6e6e3"];
+    }
+    dags -> slackapi;
+    dags -> jiraapi;
+    dags -> githubapi;
+
+    // ---------------- MCP Servers ----------------
+    subgraph cluster_mcp {
+        label="MCP Servers (interactive tooling, e.g. Claude Code)";
+        style="rounded"; color="#3f6f9e"; fontsize=13; fontcolor="#1c3a54";
+
+        mcpairflow    [label="astro-airflow-mcp", fillcolor="#e5edf4"];
+        mcpaws        [label="aws-readonly-mcp\n(AssumeRole via qbizandres-mfa)", fillcolor="#e5edf4"];
+        mcpjira       [label="jira-mcp", fillcolor="#e5edf4"];
+        mcprag        [label="rag-mcp", fillcolor="#e5edf4"];
+        mcpslack      [label="slack-mcp", fillcolor="#e5edf4"];
+        mcpsnowflake  [label="Snowflake Cortex MCP\n(native HTTP endpoint)", fillcolor="#e5edf4"];
+    }
+    mcpairflow   -> dags        [label="reads", style=dashed];
+    mcpaws       -> s3          [label="reads", style=dashed];
+    mcpjira      -> jiraapi     [label="reads/writes", style=dashed];
+    mcprag       -> ragstore    [label="reads/writes", style=dashed];
+    mcpslack     -> slackapi    [label="reads/writes", style=dashed];
+    mcpsnowflake -> snowflake   [label="reads", style=dashed];
+}
