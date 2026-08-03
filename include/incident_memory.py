@@ -59,18 +59,31 @@ def recall_similar_incidents(dag_id: str, task_logs: dict[str, str], k: int = 3)
         print(f"[incident_memory] no prior incidents on record for {dag_id}")
         return {"text": "", "tickets": []}
 
-    print(f"[incident_memory] {len(hits)} prior incident(s) for {dag_id}: "
-          f"{[h.get('title') for h in hits]}")
+    # hits are per-chunk, not per-source: a record split into several chunks can match more than
+    # once, each with the same title. Dedupe by title (keeping the first/highest-relevance
+    # occurrence) so the same prior incident doesn't get quoted or listed multiple times.
+    seen_titles: set[str] = set()
+    unique_hits = []
+    for h in hits:
+        title = h.get("title")
+        if title and title in seen_titles:
+            continue
+        if title:
+            seen_titles.add(title)
+        unique_hits.append(h)
+
+    print(f"[incident_memory] {len(unique_hits)} prior incident(s) for {dag_id}: "
+          f"{[h.get('title') for h in unique_hits]}")
     lines = [
         "Prior incidents on this pipeline (from incident memory — treat each as a LEAD to confirm "
         "against the current evidence, not as established fact):",
     ]
-    for h in hits:
+    for h in unique_hits:
         lines.append(
             f"\n--- {h.get('title', '?')} (similarity {h.get('score', 0.0):.2f}) ---\n"
             f"{(h.get('text') or '').strip()[:800]}"
         )
-    tickets = [h["title"] for h in hits if h.get("title")]
+    tickets = [h["title"] for h in unique_hits if h.get("title")]
     return {"text": "\n".join(lines), "tickets": tickets}
 
 

@@ -176,7 +176,53 @@ def get_dag_source(dag_id: str) -> str:
         return f"ERROR fetching source for dag_id={dag_id!r}: {type(exc).__name__}: {exc}"
 
 
-dag_lookup_toolset = FunctionToolset(tools=[get_dag_source, list_dag_ids])
+def find_blast_radius(dag_id: str) -> list[dict] | str:
+    """Find every DAG that transitively depends on dag_id's output via Airflow Assets (a DAG
+    scheduled to run when dag_id, or something downstream of it, produces an asset), and whether
+    each one is tagged critical. Use this to check whether a failure in a NON-critical pipeline
+    still cascades into something critical several hops downstream, even if nothing downstream
+    has actually run/failed yet — a failed producer means its asset never updates, so anything
+    scheduled off it silently never runs, rather than failing loudly itself."""
+    try:
+        base_url = _airflow_api_base_url()
+        headers = _airflow_api_headers(base_url)
+        r = requests.get(f"{base_url}/api/v2/assets", headers=headers, params={"limit": 1000}, timeout=10)
+        r.raise_for_status()
+        assets = r.json().get("assets", [])
+
+        downstream: set[str] = set()
+        seen = {dag_id}
+        frontier = {dag_id}
+        while frontier:
+            next_frontier: set[str] = set()
+            for asset in assets:
+                producers = {
+                    t.get("dag_id") for t in asset.get("producing_tasks", []) if t.get("dag_id")
+                }
+                if not (producers & frontier):
+                    continue
+                for consumer in asset.get("scheduled_dags", []):
+                    consumer_id = consumer.get("dag_id") if isinstance(consumer, dict) else consumer
+                    if consumer_id and consumer_id not in seen:
+                        downstream.add(consumer_id)
+                        next_frontier.add(consumer_id)
+                        seen.add(consumer_id)
+            frontier = next_frontier
+
+        result = []
+        for downstream_dag_id in sorted(downstream):
+            dag_r = requests.get(
+                f"{base_url}/api/v2/dags/{downstream_dag_id}", headers=headers, timeout=10
+            )
+            dag_r.raise_for_status()
+            tags = [t["name"] if isinstance(t, dict) else t for t in dag_r.json().get("tags", [])]
+            result.append({"dag_id": downstream_dag_id, "is_critical": "critical" in tags})
+        return result
+    except Exception as exc:
+        return f"ERROR computing blast radius for dag_id={dag_id!r}: {type(exc).__name__}: {exc}"
+
+
+dag_lookup_toolset = FunctionToolset(tools=[get_dag_source, list_dag_ids, find_blast_radius])
 
 
 def _build_investigation_prompt(ctx: dict, prior_incidents: dict, platform: str) -> str:
@@ -355,7 +401,7 @@ def agentic_incident_memory_v2():
         return _build_investigation_prompt(ctx, prior_incidents, "aws")
 
     @task.agent(
-        toolsets=[],
+        toolsets=[dag_lookup_toolset],
         llm_conn_id="pydanticai_default",
         model_id=MODEL_WEAK,
     )
@@ -425,11 +471,45 @@ def agentic_incident_memory_v2():
         print(f"[check_cross_pipeline_reference] {note}")
         return note
 
+    @task
+    def check_blast_radius(ctx: dict) -> str:
+        """Deterministically check whether anything downstream of the failed pipeline (via
+        Airflow Assets, possibly several hops away) is tagged critical — so decide_path can treat
+        this as urgent even when the failed pipeline itself isn't marked critical. A failed
+        producer never emits its asset, so a downstream consumer silently never runs today rather
+        than failing loudly itself — this is the only way that gets surfaced."""
+        result = find_blast_radius(ctx["failed_dag_id"])
+        if isinstance(result, str):
+            print(f"[check_blast_radius] {result}")
+            return ""
+        critical_downstream = [r["dag_id"] for r in result if r["is_critical"]]
+        if not critical_downstream:
+            return ""
+        note = (
+            f"AUTOMATED CHECK (not an opinion, a fact): {ctx['failed_dag_id']} is not itself "
+            f"tagged critical, but the following downstream pipeline(s) — reached via Airflow "
+            f"Asset dependencies, possibly several hops away — ARE tagged critical and depend on "
+            f"its output: {', '.join(critical_downstream)}. Because {ctx['failed_dag_id']} "
+            f"failed, it never produced the asset those pipelines depend on, so they will "
+            f"silently never run today rather than failing loudly themselves. Treat this the "
+            f"same as if {ctx['failed_dag_id']} were itself marked critical."
+        )
+        print(f"[check_blast_radius] {note}")
+        return note
+
     @task.llm_branch(
         llm_conn_id="pydanticai_default",
         model_id=MODEL_FRONTIER,
         system_prompt=(
             "Decide how to respond to this diagnosed pipeline failure. Choose exactly one:\n"
+            "FIRST check blast radius: if a BLAST RADIUS check below shows a critical pipeline "
+            "depends downstream on this one's output — even several hops away, even if it never "
+            "actually ran or failed itself — that overrides everything below. Route to "
+            "urgent_slack_post regardless of whether the bug is otherwise fixable. A critical "
+            "downstream pipeline silently never running today is urgent right now; a draft PR "
+            "someone reviews later is not an adequate response to that on its own — page a human "
+            "first, a code fix can still follow separately.\n"
+            "Otherwise, choose exactly one:\n"
             "- propose_code_fix: the root cause is a genuine, fixable bug in a pipeline's OWN "
             "code (e.g. a typo, wrong dict/field key, wrong type handling, an unintended "
             "aggregation) — NOT a credentials, permissions, or external-service problem. This "
@@ -442,20 +522,25 @@ def agentic_incident_memory_v2():
             "failure stop, rather than fixing what the check correctly caught — that check is "
             "doing its job; if the only available 'fix' is loosening the check, this is not a "
             "fixable code bug, route to urgent_slack_post/create_ticket_low_priority instead.\n"
-            "- urgent_slack_post: the pipeline is marked CRITICAL and the root cause is NOT a "
-            "fixable code bug (e.g. expired credentials, access denied, an upstream service down, "
-            "external schema drift, or a fix that would require weakening a QA check) — needs a "
-            "human's immediate attention right now, not a queued ticket.\n"
-            "- create_ticket_low_priority: everything else — the pipeline is not critical, so this "
-            "can be tracked as a normal backlog item instead of paging anyone.\n"
+            "- urgent_slack_post: (if not already routed here by the blast radius rule above) the "
+            "pipeline is marked CRITICAL AND the root cause is NOT a fixable code bug (e.g. "
+            "expired credentials, access denied, an upstream service down, external schema drift, "
+            "or a fix that would require weakening a QA check) — needs a human's immediate "
+            "attention right now, not a queued ticket.\n"
+            "- create_ticket_low_priority: everything else — not critical, and no critical blast "
+            "radius, so this can be tracked as a normal backlog item instead of paging anyone.\n"
             "Route to exactly one of these three tasks."
         ),
     )
-    def decide_path(diagnosis: str, ctx: dict, cross_ref_note: str) -> str:
+    def decide_path(diagnosis: str, ctx: dict, cross_ref_note: str, blast_radius_note: str) -> str:
         """Return the prompt for the fix/escalate/ticket branch decision."""
         criticality = "CRITICAL pipeline" if ctx.get("is_critical") else "not marked critical"
         note_section = f"\n\n{cross_ref_note}" if cross_ref_note else ""
-        return f"Pipeline: {ctx['failed_dag_id']} ({criticality})\n\nDiagnosis:\n{diagnosis}{note_section}"
+        blast_section = f"\n\n{blast_radius_note}" if blast_radius_note else ""
+        return (
+            f"Pipeline: {ctx['failed_dag_id']} ({criticality})\n\nDiagnosis:\n{diagnosis}"
+            f"{note_section}{blast_section}"
+        )
 
     @task.agent(
         toolsets=[dag_lookup_toolset],
@@ -889,8 +974,9 @@ def agentic_incident_memory_v2():
 
     diagnosis = merge_diagnosis(diag_aws, diag_api, diag_snowflake)
     cross_ref_note = check_cross_pipeline_reference(diagnosis, ctx)
+    blast_radius_note = check_blast_radius(ctx)
 
-    decision = decide_path(diagnosis, ctx, cross_ref_note)
+    decision = decide_path(diagnosis, ctx, cross_ref_note, blast_radius_note)
     proposed_fix = propose_code_fix(ctx, diagnosis)
     escalate_done = urgent_slack_post(diagnosis, ctx["failed_dag_id"], ctx["failed_dag_run_id"], prior)
     ticket = create_ticket_low_priority(diagnosis, ctx["failed_dag_id"], ctx["failed_dag_run_id"], prior)

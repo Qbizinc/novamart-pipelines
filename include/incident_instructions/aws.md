@@ -26,12 +26,19 @@ Investigation steps for an **AWS** platform failure (S3, IAM, Secrets Manager):
    get_dag_source to fetch that DAG's own source and verify the actual defect there before
    naming it as the root cause. If you're not sure of its exact dag_id, call list_dag_ids first
    rather than guessing a name. Don't name a specific upstream defect you haven't actually read.
-5. Return your findings as plain structured text, in exactly this format (this is the final
+5. Always call find_blast_radius(dag_id) for the failed pipeline before finishing — it tells you
+   whether any pipeline downstream (via Airflow Assets, possibly several hops away) is tagged
+   critical. A failed producer never emits its asset, so a downstream consumer silently never
+   runs today instead of failing loudly itself — this is easy to miss without checking. If it
+   returns any critical downstream pipeline(s), name them in [BLAST RADIUS].
+6. Return your findings as plain structured text, in exactly this format (this is the final
    answer — you have no other tools to call after this):
    ```
    [SUMMARY] one-line ticket title
    [DIAGNOSIS] what went wrong
    [ROOT CAUSE] why it happened
    [IMPACT] what data is missing or affected
+   [BLAST RADIUS] other pipelines put at risk downstream (omit this line entirely if
+       find_blast_radius found none)
    [RECOMMENDED FIX] concrete steps to resolve
    ```

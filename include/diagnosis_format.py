@@ -6,6 +6,8 @@ Every investigate_* agent (include/incident_instructions/*.md) is instructed to 
     [DIAGNOSIS] what went wrong
     [ROOT CAUSE] why it happened
     [IMPACT] what data is missing or affected
+    [BLAST RADIUS] what else, downstream, is affected or at risk (optional — omitted when there
+        is none worth calling out)
     [RECOMMENDED FIX] concrete steps to resolve
 
 Previously each of Slack/Jira/PR either dumped that whole block as raw text or only picked off
@@ -20,7 +22,9 @@ import re
 
 from airflow.sdk import Variable
 
-_SECTION_RE = re.compile(r"\[(SUMMARY|DIAGNOSIS|ROOT CAUSE|IMPACT|RECOMMENDED FIX)\]\s*")
+_SECTION_RE = re.compile(
+    r"\[(SUMMARY|DIAGNOSIS|ROOT CAUSE|IMPACT|BLAST RADIUS|RECOMMENDED FIX)\]\s*"
+)
 
 # Despite api.md/aws.md/snowflake.md instructing "return your findings as plain structured
 # text... this is the final answer", models sometimes wrap that block in a markdown code fence
@@ -44,7 +48,7 @@ def parse_diagnosis(text: str) -> dict[str, str]:
     if not matches:
         return {
             "summary": "", "diagnosis": (text or "").strip(),
-            "root_cause": "", "impact": "", "recommended_fix": "",
+            "root_cause": "", "impact": "", "blast_radius": "", "recommended_fix": "",
         }
 
     sections: dict[str, str] = {}
@@ -60,6 +64,7 @@ def parse_diagnosis(text: str) -> dict[str, str]:
         "diagnosis": sections.get("diagnosis", ""),
         "root_cause": sections.get("root_cause", ""),
         "impact": sections.get("impact", ""),
+        "blast_radius": sections.get("blast_radius", ""),
         "recommended_fix": sections.get("recommended_fix", ""),
     }
 
@@ -112,6 +117,8 @@ def build_incident_blocks(
     ]
     if sections.get("root_cause"):
         blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"*Root cause:*\n{sections['root_cause']}"}})
+    if sections.get("blast_radius"):
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"*Blast radius:*\n{sections['blast_radius']}"}})
     if sections.get("recommended_fix"):
         blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"*Recommended fix:*\n{sections['recommended_fix']}"}})
     if not sections.get("root_cause") and not sections.get("recommended_fix") and sections.get("diagnosis"):
@@ -144,6 +151,7 @@ def build_adf_description(sections: dict[str, str]) -> dict:
         ("Diagnosis", "diagnosis"),
         ("Root Cause", "root_cause"),
         ("Impact", "impact"),
+        ("Blast Radius", "blast_radius"),
         ("Recommended Fix", "recommended_fix"),
     ]:
         content.append(heading(label))
