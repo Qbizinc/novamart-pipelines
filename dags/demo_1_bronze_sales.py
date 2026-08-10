@@ -47,10 +47,17 @@ def demo_1_bronze_sales():
 
     @task
     def ensure_table() -> None:
-        """Create BRONZE_SALES in Snowflake if it doesn't exist yet."""
+        """Create BRONZE_SALES in Snowflake if it doesn't exist yet, and self-heal schema
+        drift on TOTAL_PRICE: `CREATE TABLE IF NOT EXISTS` is a silent no-op against an
+        already-existing table, so if TOTAL_PRICE was ever created/loaded as VARCHAR
+        (e.g. containing "26.2 USD"-style strings) it would never get fixed automatically.
+        Detect that case and migrate the column back to a proper numeric FLOAT, converting
+        existing values, instead of leaving the bad type/data in place forever.
+        """
         conn = SnowflakeHook(snowflake_conn_id="snowflake_default").get_conn()
         try:
-            conn.cursor().execute(f"""
+            cur = conn.cursor()
+            cur.execute(f"""
                 CREATE TABLE IF NOT EXISTS {BRONZE_TABLE} (
                     order_id        VARCHAR(64)   NOT NULL,
                     sku             VARCHAR(64)   NOT NULL,
@@ -64,6 +71,39 @@ def demo_1_bronze_sales():
                 )
             """)
             print(f"Table {BRONZE_TABLE} ready.")
+
+            # Check the *actual* live type of total_price — CREATE TABLE IF NOT EXISTS
+            # above would not have altered it if the table already existed with drift.
+            desc_rows = cur.execute(f"DESCRIBE TABLE {BRONZE_TABLE}").fetchall()
+            col_idx_name = 0
+            col_idx_type = 1
+            total_price_type = None
+            for row in desc_rows:
+                if row[col_idx_name].lower() == "total_price":
+                    total_price_type = row[col_idx_type]
+                    break
+
+            if total_price_type and "VARCHAR" in total_price_type.upper():
+                print(
+                    f"Detected schema drift: TOTAL_PRICE is {total_price_type}, "
+                    "expected FLOAT. Migrating column and cleaning existing values."
+                )
+                cur.execute(
+                    f"ALTER TABLE {BRONZE_TABLE} ADD COLUMN total_price_fixed FLOAT"
+                )
+                cur.execute(f"""
+                    UPDATE {BRONZE_TABLE}
+                    SET total_price_fixed = TRY_TO_DOUBLE(
+                        REGEXP_REPLACE(total_price, '[^0-9.\\-]', '')
+                    )
+                """)
+                cur.execute(
+                    f"ALTER TABLE {BRONZE_TABLE} DROP COLUMN total_price"
+                )
+                cur.execute(
+                    f"ALTER TABLE {BRONZE_TABLE} RENAME COLUMN total_price_fixed TO total_price"
+                )
+                print(f"TOTAL_PRICE column in {BRONZE_TABLE} migrated back to FLOAT.")
         finally:
             conn.close()
 
