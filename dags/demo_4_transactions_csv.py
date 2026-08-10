@@ -38,25 +38,12 @@ def demo_4_transactions_csv():
         business_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         source_record_count = len(transactions)
 
-        groups: dict[tuple[str, str], dict] = {}
-        for t in transactions:
-            key = (t["sku"], t["channel"])
-            g = groups.setdefault(key, {
-                "transaction_id": t["transaction_id"],
-                "sku": t["sku"],
-                "channel": t["channel"],
-                "quantity": 0,
-                "total_price": 0.0,
-            })
-            g["quantity"] += t["quantity"]
-            g["total_price"] += t["total_price"]
-
         header = "transaction_id,sku,channel,quantity,total_price,business_date"
         lines = [header]
-        for g in groups.values():
+        for t in transactions:
             lines.append(
-                f"{g['transaction_id']},{g['sku']},{g['channel']},{g['quantity']},"
-                f"{g['total_price']:.2f},{business_date}"
+                f"{t['transaction_id']},{t['sku']},{t['channel']},{t['quantity']},"
+                f"{t['total_price']:.2f},{business_date}"
             )
         csv_body = "\n".join(lines)
 
@@ -68,7 +55,7 @@ def demo_4_transactions_csv():
         manifest_key = f"{S3_PREFIX}/transactions_{business_date}.manifest.json"
         hook.load_string(string_data=csv_body, key=csv_key, bucket_name=bucket, replace=True)
         hook.load_string(string_data=json.dumps(manifest), key=manifest_key, bucket_name=bucket, replace=True)
-        print(f"Wrote {len(groups)} rows to s3://{bucket}/{csv_key} "
+        print(f"Wrote {len(transactions)} rows to s3://{bucket}/{csv_key} "
               f"(source_record_count={source_record_count}).")
 
     write_csv_and_manifest(fetch_transactions())
