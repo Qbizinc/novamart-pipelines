@@ -1,4 +1,4 @@
-"""Demo 2 — Silver Sales. Rebuilds SILVER_SALES from BRONZE_SALES via SELECT *."""
+"""Silver Sales. Rebuilds SILVER_SALES from BRONZE_SALES via SELECT *."""
 
 from datetime import datetime
 
@@ -12,15 +12,15 @@ SILVER_TABLE = "SANDBOX_DATA_PIPELINE.NOVAMART_RAW.SILVER_SALES"
 
 
 @dag(
-    dag_id="demo_2_silver_sales",
+    dag_id="novamart_silver_sales",
     start_date=datetime(2026, 1, 1),
     schedule=None,
     catchup=False,
     doc_md=__doc__,
-    tags=["novamart", "snowflake", "medallion", "demo", "silver"],
+    tags=["novamart", "snowflake", "medallion", "silver"],
     default_args={"on_failure_callback": trigger_incident_dag_v2},
 )
-def demo_2_silver_sales():
+def novamart_silver_sales():
 
     @task
     def build_silver() -> None:
@@ -40,4 +40,4 @@ def demo_2_silver_sales():
     build_silver()
 
 
-demo_2_silver_sales()
+novamart_silver_sales()

@@ -26,7 +26,7 @@ digraph tech_stack {
         label="Apache Airflow (Astro Runtime)";
         style="rounded"; color="#3f6f9e"; fontsize=13; fontcolor="#1c3a54";
 
-        dags       [label="DAGs\ndemo_1..6, novamart_*,\nagentic_incident_memory_v2", fillcolor="#e5edf4"];
+        dags       [label="DAGs\nnovamart_*,\nagentic_incident_memory_v2", fillcolor="#e5edf4"];
         providers  [label="Airflow providers\ncommon-ai[anthropic]\n(@task.agent / @task.llm_branch)\nsnowflake · amazon · slack", fillcolor="#e5edf4"];
 
         dags -> providers;

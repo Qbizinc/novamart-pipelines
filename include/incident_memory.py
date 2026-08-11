@@ -125,8 +125,8 @@ def record_incident(dag_id: str, run_id: str, diagnosis: str, ticket: dict,
         return None
 
 
-# --- Seeding (demo convenience) ---------------------------------------------------------------
-# A couple of realistic past incidents so the recurrence demo has something to find on the FIRST
+# --- Seeding ------------------------------------------------------------------------------------
+# A couple of realistic past incidents so recurrence detection has something to find on the FIRST
 # real investigation. Run the `novamart_incident_memory_seed` DAG once. Idempotent (re-ingest by
 # title replaces).
 
@@ -155,16 +155,16 @@ SEED_INCIDENTS: list[dict] = [
             "[ROOT CAUSE] NOVAMART_INJECT_BAD_DATA was left set to true, so generate_sales dropped the "
             "sku field from every record.\n"
             "[IMPACT] The run aborted at validation; no data reached Snowflake.\n"
-            "[RECOMMENDED FIX] Set NOVAMART_INJECT_BAD_DATA=false; the toggle is a demo fault injector, "
-            "not a production setting."
+            "[RECOMMENDED FIX] Set NOVAMART_INJECT_BAD_DATA=false; this flag should never be enabled "
+            "in a normal run."
         ),
     },
     {
-        "dag_id": "demo_one_api_escalate",
+        "dag_id": "novamart_sales_api_escalate",
         "key": "AD-1003",
         "status": "closed",
         "text": (
-            "[SUMMARY] demo_one_api_escalate failed — sales_api request timed out\n"
+            "[SUMMARY] novamart_sales_api_escalate failed — sales_api request timed out\n"
             "[DIAGNOSIS] fetch_from_api raised requests.exceptions.Timeout calling sales_api's "
             "/api/v1/sales endpoint.\n"
             "[ROOT CAUSE] sales_api was unresponsive/overloaded at the time of the request; not a "
@@ -175,22 +175,22 @@ SEED_INCIDENTS: list[dict] = [
         ),
     },
     {
-        "dag_id": "demo_3_gold_sales_by_region",
+        "dag_id": "novamart_gold_sales_by_region",
         "key": "AD-1004",
         "status": "closed",
         "text": (
-            "[SUMMARY] demo_3_gold_sales_by_region failed — SUM() error on a column expected to be numeric\n"
+            "[SUMMARY] novamart_gold_sales_by_region failed — SUM() error on a column expected to be numeric\n"
             "[DIAGNOSIS] The gold aggregation task failed running SUM() over a column sourced from "
             "SILVER_SALES; the column held non-numeric text instead of the numeric type it was "
             "defined with.\n"
             "[ROOT CAUSE] BRONZE_SALES's column was VARCHAR holding non-numeric text, not the numeric "
-            "type demo_1_bronze_sales's code defines — a discrepancy between declared and observed "
-            "schema. demo_2_silver_sales rebuilds SILVER_SALES via `SELECT *` with no explicit "
+            "type novamart_bronze_sales's code defines — a discrepancy between declared and observed "
+            "schema. novamart_silver_sales rebuilds SILVER_SALES via `SELECT *` with no explicit "
             "column list, so it carried that discrepancy straight through without erroring itself — "
             "the break only surfaced downstream, at the gold aggregation.\n"
             "[IMPACT] GOLD_SALES_BY_REGION was not refreshed for the affected run.\n"
             "[RECOMMENDED FIX] Compare BRONZE_SALES's current column types/sample values against "
-            "what demo_1_bronze_sales defines, focusing on whatever column the failing aggregation "
+            "what novamart_bronze_sales defines, focusing on whatever column the failing aggregation "
             "uses. Rebuild BRONZE_SALES with that column restored to its correct numeric type."
         ),
     },

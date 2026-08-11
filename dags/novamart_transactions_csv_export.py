@@ -1,4 +1,4 @@
-"""Demo 4 — Transactions CSV. Fetches sales_api transactions, writes a CSV + manifest to S3."""
+"""Transactions CSV Export. Fetches sales_api transactions, writes a CSV + manifest to S3."""
 
 import json
 from datetime import datetime, timezone
@@ -10,25 +10,31 @@ from airflow.sdk import Variable, dag, task
 from include.incident_callbacks import trigger_incident_dag_v2
 
 SALES_API_DEFAULT = "http://host.docker.internal:5001"
-S3_PREFIX = "demo4"
+S3_PREFIX = "transactions"
 
 
 @dag(
-    dag_id="demo_4_transactions_csv",
+    dag_id="novamart_transactions_csv_export",
     start_date=datetime(2026, 1, 1),
     schedule=None,
     catchup=False,
     doc_md=__doc__,
-    tags=["novamart", "s3", "demo", "csv"],
+    tags=["novamart", "s3", "csv"],
     default_args={"on_failure_callback": trigger_incident_dag_v2},
 )
-def demo_4_transactions_csv():
+def novamart_transactions_csv_export():
 
     @task
     def fetch_transactions() -> list[dict]:
-        base_url = Variable.get("MOCK_SALES_API_URL", default=SALES_API_DEFAULT)
-        response = requests.get(f"{base_url}/api/v1/sales", timeout=30)
-        response.raise_for_status()
+        base_url = Variable.get("SALES_API_URL", default=SALES_API_DEFAULT)
+        try:
+            response = requests.get(f"{base_url}/api/v1/sales", timeout=30)
+            response.raise_for_status()
+        except requests.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else "unknown"
+            raise RuntimeError(f"sales_api request failed with HTTP {status}") from exc
+        except requests.RequestException as exc:
+            raise RuntimeError(f"sales_api request failed: {type(exc).__name__}") from exc
         transactions = response.json()["transactions"]
         print(f"Fetched {len(transactions)} transactions from sales_api.")
         return transactions
@@ -74,4 +80,4 @@ def demo_4_transactions_csv():
     write_csv_and_manifest(fetch_transactions())
 
 
-demo_4_transactions_csv()
+novamart_transactions_csv_export()

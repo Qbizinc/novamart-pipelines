@@ -1,4 +1,4 @@
-"""Demo 8 — Marketing Daily Summary. Auto-triggered when demo_7 produces MARKETING_CAMPAIGNS; aggregates it."""
+"""Marketing Daily Summary. Auto-triggered when novamart_marketing_campaigns_ingest produces MARKETING_CAMPAIGNS; aggregates it."""
 
 from datetime import datetime, timezone
 
@@ -14,15 +14,15 @@ MARKETING_DAILY_SUMMARY_ASSET = Asset("marketing_daily_summary")
 
 
 @dag(
-    dag_id="demo_8_marketing_daily_summary",
+    dag_id="novamart_marketing_daily_summary",
     start_date=datetime(2026, 1, 1),
     schedule=[MARKETING_CAMPAIGNS_ASSET],
     catchup=False,
     doc_md=__doc__,
-    tags=["novamart", "marketing", "demo"],
+    tags=["novamart", "marketing"],
     default_args={"on_failure_callback": trigger_incident_dag_v2},
 )
-def demo_8_marketing_daily_summary():
+def novamart_marketing_daily_summary():
 
     @task(outlets=[MARKETING_DAILY_SUMMARY_ASSET])
     def build_summary() -> None:
@@ -56,4 +56,4 @@ def demo_8_marketing_daily_summary():
     build_summary()
 
 
-demo_8_marketing_daily_summary()
+novamart_marketing_daily_summary()

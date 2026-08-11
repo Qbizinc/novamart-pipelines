@@ -1,4 +1,4 @@
-"""Demo 9 — Executive Sales Report. Critical; auto-triggered when demo_8 produces MARKETING_DAILY_SUMMARY."""
+"""Executive Sales Report. Critical; auto-triggered when novamart_marketing_daily_summary produces MARKETING_DAILY_SUMMARY."""
 
 from datetime import datetime, timezone
 
@@ -13,15 +13,15 @@ MARKETING_DAILY_SUMMARY_ASSET = Asset("marketing_daily_summary")
 
 
 @dag(
-    dag_id="demo_9_exec_sales_report",
+    dag_id="novamart_exec_sales_report",
     start_date=datetime(2026, 1, 1),
     schedule=[MARKETING_DAILY_SUMMARY_ASSET],
     catchup=False,
     doc_md=__doc__,
-    tags=["novamart", "marketing", "demo", "critical"],
+    tags=["novamart", "marketing", "critical"],
     default_args={"on_failure_callback": trigger_incident_dag_v2},
 )
-def demo_9_exec_sales_report():
+def novamart_exec_sales_report():
 
     @task
     def build_report() -> None:
@@ -55,4 +55,4 @@ def demo_9_exec_sales_report():
     build_report()
 
 
-demo_9_exec_sales_report()
+novamart_exec_sales_report()

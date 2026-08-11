@@ -451,9 +451,9 @@ def agentic_incident_memory_v2():
             return ""
 
         # Match on word boundaries, not raw substring: a dag_id that is a prefix of another
-        # (demo_1 vs demo_1_bronze_sales) would otherwise report a cross-pipeline reference that
-        # the diagnosis never made. \b treats underscores as word chars, so the longer id doesn't
-        # match the shorter one.
+        # (novamart_gold vs novamart_gold_sales_by_region) would otherwise report a cross-pipeline
+        # reference that the diagnosis never made. \b treats underscores as word chars, so the
+        # longer id doesn't match the shorter one.
         mentioned = [
             d for d in all_dag_ids
             if d != failed_dag_id and re.search(rf"\b{re.escape(d)}\b", diagnosis)

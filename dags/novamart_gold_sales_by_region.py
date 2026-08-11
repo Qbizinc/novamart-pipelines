@@ -1,4 +1,4 @@
-"""Demo 3 — Gold Sales By Region. Aggregates SILVER_SALES; tagged critical -> urgent Slack escalation."""
+"""Gold Sales By Region. Aggregates SILVER_SALES; tagged critical -> urgent Slack escalation."""
 
 from datetime import datetime
 
@@ -12,15 +12,15 @@ GOLD_TABLE = "SANDBOX_DATA_PIPELINE.NOVAMART_RAW.GOLD_SALES_BY_REGION"
 
 
 @dag(
-    dag_id="demo_3_gold_sales_by_region",
+    dag_id="novamart_gold_sales_by_region",
     start_date=datetime(2026, 1, 1),
     schedule=None,
     catchup=False,
     doc_md=__doc__,
-    tags=["novamart", "snowflake", "medallion", "demo", "gold", "critical"],
+    tags=["novamart", "snowflake", "medallion", "gold", "critical"],
     default_args={"on_failure_callback": trigger_incident_dag_v2},
 )
-def demo_3_gold_sales_by_region():
+def novamart_gold_sales_by_region():
 
     @task
     def ensure_table() -> None:
@@ -61,4 +61,4 @@ def demo_3_gold_sales_by_region():
     ensure_table() >> build_gold()
 
 
-demo_3_gold_sales_by_region()
+novamart_gold_sales_by_region()

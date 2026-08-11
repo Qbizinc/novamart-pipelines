@@ -1,4 +1,4 @@
-"""Demo 5 — Load Transactions + QA. Loads demo_4's CSV into Snowflake; QA-gates on row count vs. manifest."""
+"""Transactions Load + QA. Loads the transactions CSV into Snowflake; QA-gates on row count vs. manifest."""
 
 import csv
 import io
@@ -11,20 +11,20 @@ from airflow.sdk import Variable, dag, task
 
 from include.incident_callbacks import trigger_incident_dag_v2
 
-S3_PREFIX = "demo4"
+S3_PREFIX = "transactions"
 TABLE = "SANDBOX_DATA_PIPELINE.NOVAMART_RAW.TRANSACTIONS_SUMMARY"
 
 
 @dag(
-    dag_id="demo_5_load_transactions_qa",
+    dag_id="novamart_transactions_load_qa",
     start_date=datetime(2026, 1, 1),
     schedule=None,
     catchup=False,
     doc_md=__doc__,
-    tags=["novamart", "snowflake", "demo", "qa"],
+    tags=["novamart", "snowflake", "qa"],
     default_args={"on_failure_callback": trigger_incident_dag_v2},
 )
-def demo_5_load_transactions_qa():
+def novamart_transactions_load_qa():
 
     @task
     def read_csv_and_manifest() -> dict:
@@ -99,4 +99,4 @@ def demo_5_load_transactions_qa():
     qa_check_grain(load_to_snowflake(read_csv_and_manifest()))
 
 
-demo_5_load_transactions_qa()
+novamart_transactions_load_qa()

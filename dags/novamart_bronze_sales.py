@@ -1,4 +1,4 @@
-"""Demo 1 — Bronze Sales. Creates + populates BRONZE_SALES."""
+"""Bronze Sales. Creates + populates BRONZE_SALES."""
 
 import random
 import uuid
@@ -17,15 +17,15 @@ CHANNELS = ["web", "store"]
 
 
 @dag(
-    dag_id="demo_1_bronze_sales",
+    dag_id="novamart_bronze_sales",
     start_date=datetime(2026, 1, 1),
     schedule=None,
     catchup=False,
     doc_md=__doc__,
-    tags=["novamart", "snowflake", "medallion", "demo", "bronze"],
+    tags=["novamart", "snowflake", "medallion", "bronze"],
     default_args={"on_failure_callback": trigger_incident_dag_v2},
 )
-def demo_1_bronze_sales():
+def novamart_bronze_sales():
 
     @task
     def generate_orders() -> list[dict]:
@@ -106,4 +106,4 @@ def demo_1_bronze_sales():
     ready >> load_to_snowflake(raw)
 
 
-demo_1_bronze_sales()
+novamart_bronze_sales()

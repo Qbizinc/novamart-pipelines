@@ -1,4 +1,4 @@
-"""Demo 7 — Marketing Campaigns. Fetches marketing_api campaigns and loads them."""
+"""Marketing Campaigns Ingest. Fetches marketing_api campaigns and loads them."""
 
 from datetime import datetime, timezone
 
@@ -14,20 +14,23 @@ MARKETING_CAMPAIGNS_ASSET = Asset("marketing_campaigns")
 
 
 @dag(
-    dag_id="demo_7_marketing_campaigns",
+    dag_id="novamart_marketing_campaigns_ingest",
     start_date=datetime(2026, 1, 1),
     schedule=None,
     catchup=False,
     doc_md=__doc__,
-    tags=["novamart", "marketing", "demo"],
+    tags=["novamart", "marketing"],
     default_args={"on_failure_callback": trigger_incident_dag_v2},
 )
-def demo_7_marketing_campaigns():
+def novamart_marketing_campaigns_ingest():
 
     @task
     def fetch_campaigns() -> dict:
-        base_url = Variable.get("MOCK_MARKETING_API_URL", default=MARKETING_API_DEFAULT)
-        response = requests.get(f"{base_url}/api/v1/campaigns", timeout=30)
+        base_url = Variable.get("MARKETING_API_URL", default=MARKETING_API_DEFAULT)
+        try:
+            response = requests.get(f"{base_url}/api/v1/campaigns", timeout=30)
+        except requests.RequestException as exc:
+            raise RuntimeError(f"marketing_api request failed: {type(exc).__name__}") from exc
 
         if response.status_code == 429:
             retry_after = response.headers.get("Retry-After", "unknown")
@@ -36,7 +39,12 @@ def demo_7_marketing_campaigns():
                 f"Retry-After: {retry_after}s. Response: {response.json()}"
             )
 
-        response.raise_for_status()
+        try:
+            response.raise_for_status()
+        except requests.HTTPError as exc:
+            raise RuntimeError(
+                f"marketing_api request failed with HTTP {response.status_code}"
+            ) from exc
         data = response.json()
         print(f"Fetched {len(data['campaigns'])} campaigns for {data['metadata']['business_date']}.")
         return data
@@ -76,4 +84,4 @@ def demo_7_marketing_campaigns():
     load_campaigns(fetch_campaigns())
 
 
-demo_7_marketing_campaigns()
+novamart_marketing_campaigns_ingest()

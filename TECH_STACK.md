@@ -1,6 +1,6 @@
 # NovaMart Pipelines — Tech Stack
 
-Mermaid diagram of the stack behind this demo. Render with any Mermaid-compatible tool
+Mermaid diagram of the stack behind this project. Render with any Mermaid-compatible tool
 (GitHub/GitLab markdown preview, the [Mermaid Live Editor](https://mermaid.live), VS Code's
 Mermaid extension, Obsidian, etc.) — this file has no dependency on any one renderer.
 
@@ -15,7 +15,7 @@ flowchart TB
     end
 
     subgraph AF["Apache Airflow (Astro Runtime, on Docker)"]
-        dags["DAGs\ndemo_1..6, novamart_*,\nagentic_incident_memory_v2"]
+        dags["DAGs\nnovamart_*,\nagentic_incident_memory_v2"]
         providers["Airflow providers:\ncommon-ai[anthropic] (@task.agent, @task.llm_branch)\nsnowflake, amazon, slack"]
         dags --> providers
     end
@@ -95,8 +95,9 @@ flowchart TB
 - **Incident Memory (RAG)** — also from `Qbizinc/qbiz-agents`, used as a plain library (no MCP
   server) inside the DAGs. Embeds diagnoses locally with `fastembed`, persists to a small
   on-disk index under `include/.rag-incidents`.
-- **Data Plane** — Snowflake (key-pair auth) is the warehouse the demo DAGs read/write; S3 holds
-  the CSV/manifest artifacts for the `demo_4`/`demo_5` pair.
+- **Data Plane** — Snowflake (key-pair auth) is the warehouse the pipeline DAGs read/write; S3
+  holds the CSV/manifest artifacts for the `novamart_transactions_csv_export`/
+  `novamart_transactions_load_qa` pair.
 - **Mock Data Sources** — `mock-apis-repo`, a separate Docker Compose project, stands in for
   real upstream services (`sales_api`, etc.), with a `/toggle-error` endpoint to simulate outages.
 - **Outward Integrations** — where the incident router's three outcomes actually land: a Slack
