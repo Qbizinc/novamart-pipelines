@@ -90,17 +90,22 @@ def build_incident_blocks(
     sections: dict[str, str],
     owner_mention: str = "",
     links: list[tuple[str, str]] | None = None,
-    prior_tickets: list[str] | None = None,
+    duplicate_of: str | None = None,
 ) -> tuple[list[dict], str]:
-    """Build a Slack Block Kit payload for one incident notification.
+    """Build a short Slack Block Kit alert for one incident notification.
+
+    Slack is a brief "something happened, here's where to look" alert — the header, a one-line
+    summary, and links to the Jira ticket / PR / Airflow run. Root cause, impact, and recommended
+    fix are NOT repeated here; those live in the Jira ticket description or PR body, which are the
+    comprehensive record for root-cause analysis.
 
     Returns (blocks, fallback_text) — Slack requires a plain-text `text` alongside `blocks` for
     notifications/screen readers, so both are returned together.
     """
     icon, label = {
-        "critical": (":rotating_light:", "CRITICAL"),
+        "critical": (":rotating_light:", "CRITICAL — P1 ticket"),
         "fix": (":hammer_and_wrench:", "Auto-fixed"),
-        "ticket": (":ticket:", "Ticketed (low priority)"),
+        "ticket": (":ticket:", "Ticketed — P2"),
     }[severity]
     fallback_text = f"{icon} {dag_id} — {label}"
 
@@ -113,19 +118,20 @@ def build_incident_blocks(
                 {"type": "mrkdwn", "text": f"*Run:*\n{run_id}"},
             ],
         },
-        {"type": "divider"},
     ]
-    if sections.get("root_cause"):
-        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"*Root cause:*\n{sections['root_cause']}"}})
-    if sections.get("blast_radius"):
-        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"*Blast radius:*\n{sections['blast_radius']}"}})
-    if sections.get("recommended_fix"):
-        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"*Recommended fix:*\n{sections['recommended_fix']}"}})
-    if not sections.get("root_cause") and not sections.get("recommended_fix") and sections.get("diagnosis"):
-        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"*Diagnosis:*\n{sections['diagnosis']}"}})
 
-    if prior_tickets:
-        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"*Seen before:* {', '.join(prior_tickets)}"}})
+    if duplicate_of:
+        blocks.append({
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"*Already tracked* — recurrence of `{duplicate_of}` (still open). "
+                        f"Added a comment there; no new ticket created. This is a pending item.",
+            },
+        })
+    else:
+        summary = sections.get("summary") or sections.get("diagnosis", "")[:200] or "See ticket for details."
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": summary}})
 
     for text, url in (links or []):
         blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"<{url}|{text}>"}})
@@ -157,6 +163,36 @@ def build_adf_description(sections: dict[str, str]) -> dict:
         content.append(heading(label))
         content.append(para(sections.get(key, "")))
     return {"type": "doc", "version": 1, "content": content}
+
+
+def build_duplicate_comment_adf(*, dag_id: str, run_id: str, sections: dict[str, str], run_url: str) -> dict:
+    """Jira comment ADF body recording a new occurrence of an already-open incident.
+
+    Used instead of opening a second ticket when recall_similar_incidents reports an
+    open_duplicate — the existing ticket accumulates one comment per recurrence rather than the
+    index or Jira project accumulating a duplicate ticket per run.
+    """
+    return {
+        "type": "doc",
+        "version": 1,
+        "content": [
+            {
+                "type": "paragraph",
+                "content": [{
+                    "type": "text",
+                    "text": f"Recurred on {dag_id} (run {run_id}). "
+                            f"{sections.get('summary') or sections.get('diagnosis', '')[:300]}",
+                }],
+            },
+            {
+                "type": "paragraph",
+                "content": [
+                    {"type": "text", "text": "View the failed Airflow run: "},
+                    {"type": "text", "text": run_url, "marks": [{"type": "link", "attrs": {"href": run_url}}]},
+                ],
+            },
+        ],
+    }
 
 
 def build_pr_body(*, dag_id: str, run_id: str, sections: dict[str, str], run_url: str) -> str:

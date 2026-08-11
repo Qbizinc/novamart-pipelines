@@ -248,6 +248,69 @@ def _build_investigation_prompt(ctx: dict, prior_incidents: dict, platform: str)
     )
 
 
+def _create_jira_ticket(sections: dict, *, priority: str, summary_prefix: str = "") -> dict:
+    """Create a Jira ticket for this incident, assigned to the incident owner.
+
+    Two REST calls, not one: this project's create screen silently drops `priority` if it's sent
+    in the initial POST (confirmed against the live project — Jira accepts the call but the field
+    never lands), so priority is set with a follow-up PUT instead. `assignee` DOES work on the
+    initial POST.
+    """
+    owner_account_id = Variable.get("NOVAMART_INCIDENT_OWNER_JIRA_ACCOUNT_ID", default="")
+    summary = f"{summary_prefix}{sections.get('summary') or 'pipeline failure'}"
+
+    fields: dict = {
+        "project": {"key": "AD"},
+        "summary": summary,
+        "description": diagnosis_format.build_adf_description(sections),
+        "issuetype": {"name": "Bug"},
+        "labels": ["automated", "incident-response"],
+    }
+    if owner_account_id:
+        fields["assignee"] = {"accountId": owner_account_id}
+
+    response = HttpHook(method="POST", http_conn_id="jira_api").run(
+        endpoint="/rest/api/3/issue",
+        data=json.dumps({"fields": fields}),
+        headers={"Content-Type": "application/json"},
+    )
+    data = response.json()
+    ticket = {"key": data["key"], "url": f"https://qbizinc.atlassian.net/browse/{data['key']}"}
+
+    try:
+        HttpHook(method="PUT", http_conn_id="jira_api").run(
+            endpoint=f"/rest/api/3/issue/{ticket['key']}",
+            data=json.dumps({"fields": {"priority": {"name": priority}}}),
+            headers={"Content-Type": "application/json"},
+        )
+    except Exception as exc:
+        # Best-effort: a ticket without the right priority set is still a real, useful ticket —
+        # don't let a priority-scheme quirk on the Jira side block the whole incident response.
+        print(f"[_create_jira_ticket] Could not set priority={priority!r} on {ticket['key']}: {exc}")
+
+    print(f"[_create_jira_ticket] Created {ticket['key']} (priority={priority}): {ticket['url']}")
+    return ticket
+
+
+def _add_duplicate_comment(ticket_key: str, *, dag_id: str, run_id: str, sections: dict) -> None:
+    """Best-effort: add a comment to an already-open ticket recording this new occurrence, instead
+    of opening a second ticket for the same still-unresolved issue."""
+    try:
+        HttpHook(method="POST", http_conn_id="jira_api").run(
+            endpoint=f"/rest/api/3/issue/{ticket_key}/comment",
+            data=json.dumps({
+                "body": diagnosis_format.build_duplicate_comment_adf(
+                    dag_id=dag_id, run_id=run_id, sections=sections,
+                    run_url=diagnosis_format.airflow_run_url(dag_id, run_id),
+                )
+            }),
+            headers={"Content-Type": "application/json"},
+        )
+        print(f"[_add_duplicate_comment] Added occurrence comment to {ticket_key}")
+    except Exception as exc:
+        print(f"[_add_duplicate_comment] Could not comment on {ticket_key} (continuing): {exc}")
+
+
 @dag(
     dag_id="agentic_incident_memory_v2",
     start_date=datetime(2026, 1, 1),
@@ -525,10 +588,12 @@ def agentic_incident_memory_v2():
             "- urgent_slack_post: (if not already routed here by the blast radius rule above) the "
             "pipeline is marked CRITICAL AND the root cause is NOT a fixable code bug (e.g. "
             "expired credentials, access denied, an upstream service down, external schema drift, "
-            "or a fix that would require weakening a QA check) — needs a human's immediate "
-            "attention right now, not a queued ticket.\n"
+            "or a fix that would require weakening a QA check) — opens a P1 (Highest priority) "
+            "ticket AND pages a human immediately via a tagged Slack alert, rather than waiting in "
+            "a normal queue.\n"
             "- create_ticket_low_priority: everything else — not critical, and no critical blast "
-            "radius, so this can be tracked as a normal backlog item instead of paging anyone.\n"
+            "radius — opens a P2 (Low priority) ticket that can be tracked as a normal backlog "
+            "item instead of paging anyone.\n"
             "Route to exactly one of these three tasks."
         ),
     )
@@ -837,12 +902,18 @@ def agentic_incident_memory_v2():
         return pr
 
     @task
-    def urgent_slack_post(diagnosis: str, failed_dag_id: str, failed_dag_run_id: str, prior_incidents: dict) -> None:
-        """Post an urgent, tagged Slack alert — no Jira ticket. Only for critical pipelines
-        whose root cause is not a fixable code bug."""
+    def urgent_slack_post(diagnosis: str, failed_dag_id: str, failed_dag_run_id: str, prior_incidents: dict) -> dict:
+        """Critical path: open a P1 (Highest priority) Jira ticket and post a short, tagged Slack
+        alert — or, if incident memory reports this pipeline already has the same issue open
+        (recall_similar_incidents' open_duplicate), add a comment to that ticket instead of
+        opening a second one, and say so in the Slack alert.
+
+        Returns the ticket dict (with duplicate=True when no new ticket was opened) so
+        record_incident can link it and knows whether to write a new memory record.
+        """
         incident_id = f"{failed_dag_id}:{failed_dag_run_id}"
         audit = harness_audit.new_audit_log()
-        governor = harness_audit.new_action_governor({"messages_sent": 5})
+        governor = harness_audit.new_action_governor({"tickets_created": 1, "messages_sent": 1})
 
         slack = SlackHook(slack_conn_id="slack_api")
         channel = Variable.get("SLACK_INCIDENT_CHANNEL", default="#qbiz_slackbot_testing")
@@ -850,12 +921,36 @@ def agentic_incident_memory_v2():
         owner_mention = f"<@{owner_id}>" if owner_id else ""
 
         sections = diagnosis_format.parse_diagnosis(diagnosis)
-        links = [("View the failed Airflow run", diagnosis_format.airflow_run_url(failed_dag_id, failed_dag_run_id))]
-        blocks, fallback_text = diagnosis_format.build_incident_blocks(
-            severity="critical", dag_id=failed_dag_id, run_id=failed_dag_run_id,
-            sections=sections, owner_mention=owner_mention, links=links,
-            prior_tickets=prior_incidents.get("tickets", []),
-        )
+        open_duplicate = prior_incidents.get("open_duplicate")
+
+        if open_duplicate:
+            ticket = {"key": open_duplicate["key"], "url": open_duplicate["url"], "duplicate": True}
+            _add_duplicate_comment(
+                ticket["key"], dag_id=failed_dag_id, run_id=failed_dag_run_id, sections=sections,
+            )
+            links = [
+                (f"Existing ticket {ticket['key']}", ticket["url"]),
+                ("View the failed Airflow run", diagnosis_format.airflow_run_url(failed_dag_id, failed_dag_run_id)),
+            ]
+            blocks, fallback_text = diagnosis_format.build_incident_blocks(
+                severity="critical", dag_id=failed_dag_id, run_id=failed_dag_run_id,
+                sections=sections, owner_mention=owner_mention, links=links,
+                duplicate_of=ticket["key"],
+            )
+        else:
+            harness_audit.guard_action(
+                governor, audit, kind="tickets_created", action="urgent_slack_post",
+                incident_id=incident_id, job_id=failed_dag_run_id,
+            )
+            ticket = _create_jira_ticket(sections, priority="Highest")
+            links = [
+                (f"Jira ticket {ticket['key']}", ticket["url"]),
+                ("View the failed Airflow run", diagnosis_format.airflow_run_url(failed_dag_id, failed_dag_run_id)),
+            ]
+            blocks, fallback_text = diagnosis_format.build_incident_blocks(
+                severity="critical", dag_id=failed_dag_id, run_id=failed_dag_run_id,
+                sections=sections, owner_mention=owner_mention, links=links,
+            )
 
         harness_audit.guard_action(
             governor, audit, kind="messages_sent", action="urgent_slack_post",
@@ -865,64 +960,65 @@ def agentic_incident_memory_v2():
         audit.record(
             agent_id=harness_audit.DAG_ID, action="urgent_slack_post", decision="allowed",
             incident_id=incident_id, cohort=harness_audit.COHORT, job_id=failed_dag_run_id,
-            outputs={"channel": channel},
+            outputs={"channel": channel, "ticket_key": ticket["key"], "duplicate": bool(open_duplicate)},
         )
+        return ticket
 
     @task
     def create_ticket_low_priority(diagnosis: str, failed_dag_id: str, failed_dag_run_id: str, prior_incidents: dict) -> dict:
-        """Create a low-priority Jira ticket, plus a quiet (no @mention) Slack FYI linking it.
-        Only for non-critical pipelines."""
+        """Normal path: open a P2 (Low priority) Jira ticket and post a short, tagged Slack alert
+        — or, same as urgent_slack_post, add a comment to an already-open duplicate instead of
+        opening a second ticket. Only for non-critical pipelines."""
         incident_id = f"{failed_dag_id}:{failed_dag_run_id}"
         audit = harness_audit.new_audit_log()
         governor = harness_audit.new_action_governor({"tickets_created": 1, "messages_sent": 1})
 
-        sections = diagnosis_format.parse_diagnosis(diagnosis)
-        summary = f"[Low priority] {sections['summary'] or f'{failed_dag_id} pipeline failure'}"
-
-        harness_audit.guard_action(
-            governor, audit, kind="tickets_created", action="create_ticket_low_priority",
-            incident_id=incident_id, job_id=failed_dag_run_id,
-        )
-        response = HttpHook(method="POST", http_conn_id="jira_api").run(
-            endpoint="/rest/api/3/issue",
-            data=json.dumps({
-                "fields": {
-                    "project": {"key": "AD"},
-                    "summary": summary,
-                    "description": diagnosis_format.build_adf_description(sections),
-                    "issuetype": {"name": "Bug"},
-                    "priority": {"name": "Low"},
-                    "labels": ["automated", "incident-response"],
-                }
-            }),
-            headers={"Content-Type": "application/json"},
-        )
-        data = response.json()
-        ticket = {"key": data["key"], "url": f"https://qbizinc.atlassian.net/browse/{data['key']}"}
-        print(f"[create_ticket_low_priority] Created {ticket['key']}: {ticket['url']}")
-
+        slack = SlackHook(slack_conn_id="slack_api")
         channel = Variable.get("SLACK_INCIDENT_CHANNEL", default="#qbiz_slackbot_testing")
-        links = [
-            (f"Jira ticket {ticket['key']}", ticket["url"]),
-            ("View the failed Airflow run", diagnosis_format.airflow_run_url(failed_dag_id, failed_dag_run_id)),
-        ]
-        blocks, fallback_text = diagnosis_format.build_incident_blocks(
-            severity="ticket", dag_id=failed_dag_id, run_id=failed_dag_run_id,
-            sections=sections, owner_mention="", links=links,
-            prior_tickets=prior_incidents.get("tickets", []),
-        )
+        owner_id = Variable.get("NOVAMART_INCIDENT_OWNER_SLACK_ID", default="")
+        owner_mention = f"<@{owner_id}>" if owner_id else ""
+
+        sections = diagnosis_format.parse_diagnosis(diagnosis)
+        open_duplicate = prior_incidents.get("open_duplicate")
+
+        if open_duplicate:
+            ticket = {"key": open_duplicate["key"], "url": open_duplicate["url"], "duplicate": True}
+            _add_duplicate_comment(
+                ticket["key"], dag_id=failed_dag_id, run_id=failed_dag_run_id, sections=sections,
+            )
+            links = [
+                (f"Existing ticket {ticket['key']}", ticket["url"]),
+                ("View the failed Airflow run", diagnosis_format.airflow_run_url(failed_dag_id, failed_dag_run_id)),
+            ]
+            blocks, fallback_text = diagnosis_format.build_incident_blocks(
+                severity="ticket", dag_id=failed_dag_id, run_id=failed_dag_run_id,
+                sections=sections, owner_mention=owner_mention, links=links,
+                duplicate_of=ticket["key"],
+            )
+        else:
+            harness_audit.guard_action(
+                governor, audit, kind="tickets_created", action="create_ticket_low_priority",
+                incident_id=incident_id, job_id=failed_dag_run_id,
+            )
+            ticket = _create_jira_ticket(sections, priority="Low")
+            links = [
+                (f"Jira ticket {ticket['key']}", ticket["url"]),
+                ("View the failed Airflow run", diagnosis_format.airflow_run_url(failed_dag_id, failed_dag_run_id)),
+            ]
+            blocks, fallback_text = diagnosis_format.build_incident_blocks(
+                severity="ticket", dag_id=failed_dag_id, run_id=failed_dag_run_id,
+                sections=sections, owner_mention=owner_mention, links=links,
+            )
+
         harness_audit.guard_action(
             governor, audit, kind="messages_sent", action="create_ticket_low_priority",
             incident_id=incident_id, job_id=failed_dag_run_id,
         )
-        SlackHook(slack_conn_id="slack_api").call(
-            "chat.postMessage", json={"channel": channel, "blocks": blocks, "text": fallback_text}
-        )
-
+        slack.call("chat.postMessage", json={"channel": channel, "blocks": blocks, "text": fallback_text})
         audit.record(
             agent_id=harness_audit.DAG_ID, action="create_ticket_low_priority", decision="allowed",
             incident_id=incident_id, cohort=harness_audit.COHORT, job_id=failed_dag_run_id,
-            outputs={"ticket_key": ticket["key"], "ticket_url": ticket["url"]},
+            outputs={"ticket_key": ticket["key"], "duplicate": bool(open_duplicate)},
         )
         return ticket
 
@@ -933,25 +1029,40 @@ def agentic_incident_memory_v2():
         failed_dag_run_id: str,
         fix_result: dict | None,
         ticket: dict | None,
-        _escalate_done: None,
+        escalate_ticket: dict | None,
     ) -> None:
         """Record the resolved incident in memory (best-effort), regardless of which path ran.
 
-        Exactly one of fix_result/ticket is meaningfully non-None (urgent_slack_post has neither
-        — nothing to link, just an alert — _escalate_done is unused, taken only so this task has
-        an explicit dependency edge on that branch too). trigger_rule=none_failed_min_one_success
-        lets this run despite two of the three decide_path branches being skipped.
+        Exactly one of fix_result/ticket/escalate_ticket is meaningfully non-None per run (the
+        other two are None — their tasks were skipped by decide_path). trigger_rule=
+        none_failed_min_one_success lets this run despite two of the three decide_path branches
+        being skipped.
+
+        When the ticket path (either priority) found an open duplicate, ticket/escalate_ticket
+        carries duplicate=True — a comment was already added to the EXISTING ticket, so no new
+        memory record is written here; writing one would just re-ingest the same title with
+        slightly different wording on every recurrence instead of leaving the original alone.
         """
-        ticket_like = fix_result if (fix_result and fix_result.get("url")) else (ticket or {})
-        incident_memory.record_incident(
-            failed_dag_id, failed_dag_run_id, diagnosis, ticket_like, status="open"
-        )
+        ticket_like = fix_result or ticket or escalate_ticket or {}
 
         # Which branch ran is decided by which XCom is non-None (skipped tasks yield None) — NOT by
         # whether a PR URL came back. open_pr degrades to {"url": None} when github_api isn't
         # configured, and keying off the URL would mislabel that still-took-the-fix-path run as an
         # escalation in the audit trail.
-        path = "fix" if fix_result is not None else ("ticket" if ticket else "escalate")
+        if fix_result is not None:
+            path = "fix"
+        elif ticket is not None:
+            path = "ticket"
+        else:
+            path = "escalate"
+
+        is_duplicate = bool(ticket_like.get("duplicate"))
+        if not is_duplicate:
+            record_target = fix_result if (fix_result and fix_result.get("url")) else ticket_like
+            incident_memory.record_incident(
+                failed_dag_id, failed_dag_run_id, diagnosis, record_target, status="open"
+            )
+
         audit = harness_audit.new_audit_log()
         audit.record(
             agent_id=harness_audit.DAG_ID,
@@ -960,7 +1071,7 @@ def agentic_incident_memory_v2():
             incident_id=f"{failed_dag_id}:{failed_dag_run_id}",
             cohort=harness_audit.COHORT,
             job_id=failed_dag_run_id,
-            outputs={"path": path},
+            outputs={"path": path, "duplicate": is_duplicate},
         )
 
     ctx = gather_context()
@@ -978,16 +1089,16 @@ def agentic_incident_memory_v2():
 
     decision = decide_path(diagnosis, ctx, cross_ref_note, blast_radius_note)
     proposed_fix = propose_code_fix(ctx, diagnosis)
-    escalate_done = urgent_slack_post(diagnosis, ctx["failed_dag_id"], ctx["failed_dag_run_id"], prior)
+    escalate_ticket = urgent_slack_post(diagnosis, ctx["failed_dag_id"], ctx["failed_dag_run_id"], prior)
     ticket = create_ticket_low_priority(diagnosis, ctx["failed_dag_id"], ctx["failed_dag_run_id"], prior)
-    decision >> [proposed_fix, escalate_done, ticket]
+    decision >> [proposed_fix, escalate_ticket, ticket]
 
     validated_fix = validate_proposed_fix(proposed_fix, ctx["failed_dag_id"], ctx["failed_dag_run_id"])
     pr = open_pr(validated_fix, diagnosis, ctx["failed_dag_id"], ctx["failed_dag_run_id"])
     fix_result = notify_slack_fix(pr, diagnosis, ctx["failed_dag_id"], ctx["failed_dag_run_id"])
 
     record_incident(
-        diagnosis, ctx["failed_dag_id"], ctx["failed_dag_run_id"], fix_result, ticket, escalate_done
+        diagnosis, ctx["failed_dag_id"], ctx["failed_dag_run_id"], fix_result, ticket, escalate_ticket
     )
 
 
