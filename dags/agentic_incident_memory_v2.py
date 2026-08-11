@@ -90,17 +90,11 @@ GITHUB_REPO = "Qbizinc/novamart-pipelines"
 
 # The only two models this DAG's agent/branch steps are allowed to use — see
 # harness_audit.new_model_policy() for which activity is capped/floored at which tier, and why.
+# Each task below passes its model_id through harness_audit.guarded_model_id(activity, model_id)
+# at the decorator call site, so the value the policy checks and the value the task actually
+# uses are the same expression — there is no separate mirror dict that can drift out of sync.
 MODEL_WEAK = "anthropic:claude-haiku-4-5"
 MODEL_FRONTIER = "anthropic:claude-sonnet-5"
-
-harness_audit.enforce_model_policy({
-    "classify_platform": MODEL_WEAK,
-    "investigate_aws": MODEL_WEAK,
-    "investigate_api": MODEL_WEAK,
-    "investigate_snowflake": MODEL_FRONTIER,
-    "decide_path": MODEL_FRONTIER,
-    "propose_code_fix": MODEL_FRONTIER,
-})
 
 
 class ResilientHookToolset(HookToolset):
@@ -358,7 +352,7 @@ def agentic_incident_memory_v2():
 
     @task.llm_branch(
         llm_conn_id="pydanticai_default",
-        model_id=MODEL_WEAK,
+        model_id=harness_audit.guarded_model_id("classify_platform", MODEL_WEAK),
         system_prompt=(
             "You are triaging a data pipeline failure. Classify which platform the failure "
             "belongs to, based on the failed task's exception text. Choose exactly one:\n"
@@ -394,7 +388,7 @@ def agentic_incident_memory_v2():
             dag_lookup_toolset,
         ],
         llm_conn_id="pydanticai_default",
-        model_id=MODEL_WEAK,
+        model_id=harness_audit.guarded_model_id("investigate_aws", MODEL_WEAK),
     )
     def investigate_aws(ctx: dict, prior_incidents: dict) -> str:
         """Diagnose an AWS (S3/IAM) platform failure. Only runs when classify_platform routes here."""
@@ -403,7 +397,7 @@ def agentic_incident_memory_v2():
     @task.agent(
         toolsets=[dag_lookup_toolset],
         llm_conn_id="pydanticai_default",
-        model_id=MODEL_WEAK,
+        model_id=harness_audit.guarded_model_id("investigate_api", MODEL_WEAK),
     )
     def investigate_api(ctx: dict, prior_incidents: dict) -> str:
         """Diagnose an upstream API platform failure. Only runs when classify_platform routes here."""
@@ -415,7 +409,7 @@ def agentic_incident_memory_v2():
             dag_lookup_toolset,
         ],
         llm_conn_id="pydanticai_default",
-        model_id=MODEL_FRONTIER,
+        model_id=harness_audit.guarded_model_id("investigate_snowflake", MODEL_FRONTIER),
     )
     def investigate_snowflake(ctx: dict, prior_incidents: dict) -> str:
         """Diagnose a Snowflake platform failure. Only runs when classify_platform routes here."""
@@ -499,7 +493,7 @@ def agentic_incident_memory_v2():
 
     @task.llm_branch(
         llm_conn_id="pydanticai_default",
-        model_id=MODEL_FRONTIER,
+        model_id=harness_audit.guarded_model_id("decide_path", MODEL_FRONTIER),
         system_prompt=(
             "Decide how to respond to this diagnosed pipeline failure. Choose exactly one:\n"
             "FIRST check blast radius: if a BLAST RADIUS check below shows a critical pipeline "
@@ -545,7 +539,7 @@ def agentic_incident_memory_v2():
     @task.agent(
         toolsets=[dag_lookup_toolset],
         llm_conn_id="pydanticai_default",
-        model_id=MODEL_FRONTIER,
+        model_id=harness_audit.guarded_model_id("propose_code_fix", MODEL_FRONTIER),
     )
     def propose_code_fix(ctx: dict, diagnosis: str) -> str:
         """Propose a corrected version of whichever file actually contains the bug — which may

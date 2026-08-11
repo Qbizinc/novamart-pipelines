@@ -94,9 +94,9 @@ def new_model_policy():
     """Build the model-tier policy for this DAG's agent/branch steps.
 
     Unlike the other constructors here, this is meant to be called at DAG *parse* time (see
-    agentic_incident_memory_v2.py's module-level enforce_model_policy() call) — a model-tier
-    violation should fail DAG parsing outright, not wait for a task to run. That is a deliberate
-    exception to this module's usual "qbiz_harness only loads at task execution" rule.
+    guarded_model_id() below) — a model-tier violation should fail DAG parsing outright, not wait
+    for a task to run. That is a deliberate exception to this module's usual "qbiz_harness only
+    loads at task execution" rule.
 
     classify_platform/investigate_aws/investigate_api are cheap triage/classification steps and
     are capped at WEAK on purpose (cost control — a trivial step shouldn't self-escalate).
@@ -121,9 +121,18 @@ def new_model_policy():
     return ModelPolicy(tier_map=tier_map, activities=activities)
 
 
-def enforce_model_policy(model_by_activity: dict[str, str]) -> None:
-    """Check every activity's configured model against the policy; raises ModelPolicyError on
-    the first violation. Called at DAG parse time, not per-task — see new_model_policy()."""
-    policy = new_model_policy()
-    for activity, model in model_by_activity.items():
-        policy.check(activity, model)
+def guarded_model_id(activity: str, model_id: str) -> str:
+    """Check `model_id` against this DAG's model-tier policy and return it unchanged.
+
+    Meant to be called inline as the `model_id=` kwarg on a task's `@task.agent`/
+    `@task.llm_branch` decorator — e.g. `model_id=harness_audit.guarded_model_id(
+    "investigate_aws", MODEL_WEAK)` — so the value the policy checks and the value the task
+    actually runs on are the same expression, not two hand-maintained copies that can drift
+    apart. Replaces the old enforce_model_policy(dict) entry point, which checked a separately
+    maintained mirror of each task's model_id and could silently fall out of sync with it.
+
+    Raises ModelPolicyError (a HarnessError) at DAG *parse* time on a violation, same timing as
+    before — decorator kwargs evaluate when the module is parsed.
+    """
+    new_model_policy().check(activity, model_id)
+    return model_id
