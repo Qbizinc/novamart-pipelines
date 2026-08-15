@@ -42,7 +42,6 @@ def novamart_transactions_csv_export():
     @task
     def write_csv_and_manifest(transactions: list[dict]) -> None:
         business_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        source_record_count = len(transactions)
 
         groups: dict[tuple[str, str], dict] = {}
         for t in transactions:
@@ -56,6 +55,11 @@ def novamart_transactions_csv_export():
             })
             g["quantity"] += t["quantity"]
             g["total_price"] += t["total_price"]
+
+        # The CSV is written at (sku, channel) grain, so the manifest's
+        # source_record_count must reflect the number of aggregated rows,
+        # not the number of raw pre-aggregation transactions.
+        source_record_count = len(groups)
 
         header = "transaction_id,sku,channel,quantity,total_price,business_date"
         lines = [header]
