@@ -14,6 +14,8 @@ multi-host store.
 """
 from __future__ import annotations
 
+import json
+
 AUDIT_LOG_PATH = "/usr/local/airflow/include/.harness-audit/audit.jsonl"
 DAG_ID = "agentic_incident_memory_v2"
 COHORT = "novamart"
@@ -30,6 +32,41 @@ def new_audit_log():
     from qbiz_harness import AuditLog
 
     return AuditLog(path=AUDIT_LOG_PATH)
+
+
+def find_intervention(job_id: str) -> dict | None:
+    """The harness intervention recorded against `job_id`, if the failure was one.
+
+    When a control blocks a step, the *failing* DAG writes a `harness_intervention` record
+    carrying that run's job_id. Reading it back lets the incident response tell a governance
+    event ("someone pointed a capped step at a frontier model") apart from a data incident
+    ("the gold table is broken"). They want different handling: a config violation is already
+    prevented and belongs on the harness console, not in the incident queue as a work item
+    nobody needs to triage.
+
+    Best-effort by design, like the rest of this module: an unreadable trail degrades to
+    "treat it as a normal incident", which is the safe direction to be wrong in.
+    """
+    try:
+        with open(AUDIT_LOG_PATH, encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                record = json.loads(line)
+                if record.get("job_id") != job_id:
+                    continue
+                if record.get("event_type") == "agent_action":
+                    continue
+                intervention = record.get("intervention") or {}
+                return {
+                    "component": intervention.get("component", "unknown"),
+                    "prevented": intervention.get("prevented", ""),
+                    "action": record.get("action", ""),
+                }
+    except Exception as exc:
+        print(f"[harness_audit] could not scan the trail for {job_id} (continuing): {exc}")
+    return None
 
 
 def new_action_governor(action_limits: dict[str, int]):
@@ -91,18 +128,19 @@ def guard_output(audit, *, response, expected_schema: dict, action: str, inciden
 
 
 def new_model_policy():
-    """Build the model-tier policy for this DAG's agent/branch steps.
-
-    Unlike the other constructors here, this is meant to be called at DAG *parse* time (see
-    agentic_incident_memory_v2.py's module-level enforce_model_policy() call) — a model-tier
-    violation should fail DAG parsing outright, not wait for a task to run. That is a deliberate
-    exception to this module's usual "qbiz_harness only loads at task execution" rule.
+    """Build the model-tier policy shared across every DAG that uses this module — one policy
+    object, not one per DAG, the same way a real org would centrally govern model-tier spend
+    rather than let each pipeline define its own rules.
 
     classify_platform/investigate_aws/investigate_api are cheap triage/classification steps and
     are capped at WEAK on purpose (cost control — a trivial step shouldn't self-escalate).
     investigate_snowflake/decide_path/propose_code_fix are hard-floored at FRONTIER: this session
     found by direct experiment that a WEAK model on these steps finds the right evidence and then
     reasons past it anyway (see git history) — that floor is evidence-backed, not a preference.
+    summarize_exec_report (novamart_exec_sales_report) is capped at WEAK for the opposite reason:
+    templating already-validated numbers into a paragraph is mechanical, no reasoning required, so
+    a frontier model there is pure cost with no quality upside — the textbook case for a ceiling
+    rather than a floor.
     """
     from qbiz_harness import ActivityBand, ModelPolicy, Tier
 
@@ -117,13 +155,50 @@ def new_model_policy():
         "investigate_snowflake": ActivityBand(max_tier=Tier.FRONTIER, min_tier=Tier.FRONTIER, floor_hard=True),
         "decide_path": ActivityBand(max_tier=Tier.FRONTIER, min_tier=Tier.FRONTIER, floor_hard=True),
         "propose_code_fix": ActivityBand(max_tier=Tier.FRONTIER, min_tier=Tier.FRONTIER, floor_hard=True),
+        "summarize_exec_report": ActivityBand(max_tier=Tier.WEAK),
     }
     return ModelPolicy(tier_map=tier_map, activities=activities)
 
 
 def enforce_model_policy(model_by_activity: dict[str, str]) -> None:
     """Check every activity's configured model against the policy; raises ModelPolicyError on
-    the first violation. Called at DAG parse time, not per-task — see new_model_policy()."""
+    the first violation. Called at DAG *parse* time (agentic_incident_memory_v2.py's module-level
+    call) — for DAGs whose model choice is a hardcoded constant, a violation should fail DAG
+    parsing outright rather than wait for a task to run. That is a deliberate exception to this
+    module's usual "qbiz_harness only loads at task execution" rule.
+
+    For a DAG whose model choice is only known at task RUNTIME (e.g. read from an Airflow
+    Variable, so it can be toggled without a redeploy) use check_model_policy() instead — same
+    policy, but checked per-task-run so a violation fails that task (and can cascade into
+    on_failure_callback) instead of blocking the DAG from ever parsing.
+    """
     policy = new_model_policy()
     for activity, model in model_by_activity.items():
         policy.check(activity, model)
+
+
+def check_model_policy(activity: str, model_id: str, *, agent_id: str, incident_id: str, job_id: str) -> None:
+    """Runtime counterpart to enforce_model_policy() — see that function's docstring for when to
+    use which. On violation, best-effort logs the intervention (never let audit logging itself
+    mask the real policy violation) then re-raises — same never-work-around rule as
+    guard_action/guard_output: a caught HarnessError routes to re-prompt/escalate/halt, not a
+    silent fallback to a different model.
+    """
+    from qbiz_harness import ModelPolicyError
+
+    try:
+        new_model_policy().check(activity, model_id)
+    except ModelPolicyError as exc:
+        try:
+            new_audit_log().record_intervention(
+                agent_id=agent_id,
+                action=activity,
+                component="model_policy",
+                prevented=str(exc),
+                incident_id=incident_id,
+                cohort=COHORT,
+                job_id=job_id,
+            )
+        except Exception:
+            pass
+        raise

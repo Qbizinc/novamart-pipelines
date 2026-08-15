@@ -16,3 +16,6 @@ keys/
 include/.rag-incidents/
 # Harness audit trail — local state, never commit
 include/.harness-audit/
+
+# Backups of the local settings file — these contain plaintext credentials.
+*.bak

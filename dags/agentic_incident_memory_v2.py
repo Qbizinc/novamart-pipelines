@@ -14,7 +14,12 @@ include/incident_callbacks.py:trigger_incident_dag_v2), or manually from the UI.
 1. gather_context           — pre-fetch failed task logs + pipeline source via the Airflow REST
                                API. Also reads the failing DAG's own tags to determine
                                is_critical (a "critical" tag on that DAG).
-2. recall_prior_incidents   — recurrence detection (incident memory).
+2. recall_prior_incidents   — incident memory, in two tiers. Tier 1 is this pipeline's own
+                               history and is the only thing that can suppress a ticket; tier 2 is
+                               similar incidents on OTHER pipelines, offered as leads and never
+                               used to dedupe. Only RESOLVED incidents count as knowledge — an
+                               open ticket has no fix written in it yet, so it feeds duplicate
+                               detection and nothing else.
 3. classify_platform        — @task.llm_branch: routes to investigate_aws / investigate_api /
                                investigate_snowflake based on the failure's exception text. This
                                decision is about *how to investigate* — which tailored instructions
@@ -39,12 +44,27 @@ include/incident_callbacks.py:trigger_incident_dag_v2), or manually from the UI.
                                    draft -> notify_slack_fix posts the PR link, tagging the
                                    incident owner. Review happens on the PR itself (GitHub's own
                                    diff view), not via an Airflow-side approval gate.
-                                 - urgent_slack_post: pipeline is critical AND the failure is NOT
-                                   a code bug -> immediate tagged Slack alert, no ticket.
+                                 - urgent_slack_post: pipeline is critical (or something critical
+                                   depends on it downstream) AND the failure is NOT a code bug ->
+                                   a P1 Jira ticket and an immediate tagged Slack alert.
                                  - create_ticket_low_priority: not critical -> a normal-priority
                                    Jira ticket, plus a quiet Slack FYI (no @mention) linking it.
+
+                               Two cases short-circuit all three paths:
+                                 - ALREADY OPEN: recall found the same issue still open on this
+                                   pipeline -> Slack line naming the existing ticket, and nothing
+                                   else. No new ticket, and the existing one is NOT commented on:
+                                   it is someone's workspace, and an agent appending to it on
+                                   every recurrence buries what the assignee wrote.
+                                 - HARNESS-CAUSED: the failure was a control firing (see
+                                   harness_audit.find_intervention) rather than a data problem.
+                                   Nothing outward at all — no ticket, no Slack. The remedy is
+                                   reverting a config value, and the harness console is the only
+                                   surface where a fired control is legible.
 7. record_incident          — records the resolved incident in memory regardless of which path
-                               ran (trigger_rule=none_failed_min_one_success).
+                               ran (trigger_rule=none_failed_min_one_success). Records the path
+                               taken in the audit trail, including "governance" for a
+                               harness-caused failure, so the console can count what it prevented.
 
 ### Required Airflow Connections (set in airflow_settings.yaml)
 - snowflake_default : Snowflake, key-pair auth
@@ -87,6 +107,13 @@ from include import diagnosis_format, harness_audit, incident_memory
 
 INSTRUCTIONS_DIR = "/usr/local/airflow/include/incident_instructions"
 GITHUB_REPO = "Qbizinc/novamart-pipelines"
+
+# Jira's hard limit on the issue summary field — exceeding it is a 400, not a truncation.
+JIRA_SUMMARY_MAX = 255
+
+# What a title should actually be, as opposed to what Jira will tolerate. Tickets and PRs get
+# read in list views and on projectors; past roughly this length a title stops being scannable.
+TICKET_SUMMARY_TARGET = 110
 
 # The only two models this DAG's agent/branch steps are allowed to use — see
 # harness_audit.new_model_policy() for which activity is capped/floored at which tier, and why.
@@ -248,8 +275,70 @@ def _build_investigation_prompt(ctx: dict, prior_incidents: dict, platform: str)
     )
 
 
-def _create_jira_ticket(sections: dict, *, priority: str, summary_prefix: str = "") -> dict:
+def _dag_id_from_path(file_path: str) -> str | None:
+    """'dags/novamart_transactions_csv_export.py' -> 'novamart_transactions_csv_export'."""
+    match = re.match(r"^dags/([\w\-]+)\.py$", (file_path or "").strip())
+    return match.group(1) if match else None
+
+
+def _closed_recurrence_of(prior_incidents: dict) -> str | None:
+    """Ticket key this incident repeats, when the prior one is already closed.
+
+    Only set for a same-pipeline match above the duplicate threshold. A closed match never
+    suppresses the new ticket (see incident_memory) — it is cited in it.
+    """
+    closed = (prior_incidents or {}).get("closed_recurrence")
+    return closed.get("key") if closed else None
+
+
+def _ticket_summary(dag_id: str, sections: dict, summary_prefix: str = "") -> str:
+    """`[<dag_id>] <symptom>` — the pipeline name is prepended in CODE, never left to the model.
+
+    The dag_id in the title is load-bearing in production: it makes tickets greppable per pipeline
+    (JQL `summary ~ "[novamart_gold_sales_by_region]"`), groups a recurring failure visibly in any
+    backlog view, and lets a human recognise "this pipeline again" at a glance. The agent's own
+    [SUMMARY] usually mentions the pipeline, but "usually" is not a naming convention — a model
+    that phrases it differently one run would silently break the grouping.
+    """
+    symptom = (sections.get("summary") or "pipeline failure").strip()
+    # Don't say it twice when the model already led with the dag_id. Models almost always phrase
+    # it "<dag_id> failed — <symptom>", so drop the linking verb too, otherwise the bracketed
+    # title reads "[novamart_silver_sales] failed — SUM() error ...".
+    if symptom.lower().startswith(dag_id.lower()):
+        symptom = symptom[len(dag_id):].lstrip(" :-—")
+        symptom = re.sub(r"^(failed|failure|error)\b[\s:—–-]*", "", symptom, flags=re.I)
+    symptom = symptom.strip() or "pipeline failure"
+
+    # Two limits, for two different reasons. Jira rejects anything over 255 with a 400 — which
+    # fails the task *after* the PR is already open. Long before that, a title that runs past
+    # ~90 characters stops working as a title: it is read in a backlog list and on a projector,
+    # where a paragraph is just noise. The instructions ask for a short headline; this enforces
+    # it, because a model that writes an essay would otherwise ship it. The full text is in the
+    # description either way, so nothing is lost by cutting here.
+    prefix = f"{summary_prefix}[{dag_id}] "
+    keep = max(TICKET_SUMMARY_TARGET - len(prefix), 40)
+    if len(symptom) > keep:
+        cut = symptom[:keep]
+        # Cut on a word boundary — "…manifest sourc…" reads like a bug, "…manifest…" reads like
+        # a trim. Only if that leaves something substantial, else take the hard cut.
+        space = cut.rfind(" ")
+        symptom = (cut[:space] if space > keep * 0.6 else cut).rstrip(" ,;:—-") + "…"
+    return (prefix + symptom)[:JIRA_SUMMARY_MAX]
+
+
+def _create_jira_ticket(
+    sections: dict, *, dag_id: str, priority: str, summary_prefix: str = "",
+    extra_links: list[tuple[str, str]] | None = None,
+    related: list[dict] | None = None, recurrence_of: str | None = None,
+) -> dict:
     """Create a Jira ticket for this incident, assigned to the incident owner.
+
+    extra_links (e.g. a PR opened for this same incident) render as clickable links in the
+    ticket description, under their own "Related Links" heading.
+
+    `related` / `recurrence_of` carry the incident-memory provenance — which prior incidents the
+    agent was shown, and which closed ticket this repeats — so the ticket states on its face what
+    prior knowledge went into it instead of that being invisible.
 
     Two REST calls, not one: this project's create screen silently drops `priority` if it's sent
     in the initial POST (confirmed against the live project — Jira accepts the call but the field
@@ -257,14 +346,22 @@ def _create_jira_ticket(sections: dict, *, priority: str, summary_prefix: str = 
     initial POST.
     """
     owner_account_id = Variable.get("NOVAMART_INCIDENT_OWNER_JIRA_ACCOUNT_ID", default="")
-    summary = f"{summary_prefix}{sections.get('summary') or 'pipeline failure'}"
+    summary = _ticket_summary(dag_id, sections, summary_prefix)
+
+    labels = ["automated", "incident-response", f"pipeline-{dag_id}"]
+    if recurrence_of:
+        labels.append("recurrence")
+    if related:
+        labels.append("knowledge-reuse")
 
     fields: dict = {
         "project": {"key": "AD"},
         "summary": summary,
-        "description": diagnosis_format.build_adf_description(sections),
+        "description": diagnosis_format.build_adf_description(
+            sections, links=extra_links, related=related, recurrence_of=recurrence_of,
+        ),
         "issuetype": {"name": "Bug"},
-        "labels": ["automated", "incident-response"],
+        "labels": labels,
     }
     if owner_account_id:
         fields["assignee"] = {"accountId": owner_account_id}
@@ -291,24 +388,6 @@ def _create_jira_ticket(sections: dict, *, priority: str, summary_prefix: str = 
     print(f"[_create_jira_ticket] Created {ticket['key']} (priority={priority}): {ticket['url']}")
     return ticket
 
-
-def _add_duplicate_comment(ticket_key: str, *, dag_id: str, run_id: str, sections: dict) -> None:
-    """Best-effort: add a comment to an already-open ticket recording this new occurrence, instead
-    of opening a second ticket for the same still-unresolved issue."""
-    try:
-        HttpHook(method="POST", http_conn_id="jira_api").run(
-            endpoint=f"/rest/api/3/issue/{ticket_key}/comment",
-            data=json.dumps({
-                "body": diagnosis_format.build_duplicate_comment_adf(
-                    dag_id=dag_id, run_id=run_id, sections=sections,
-                    run_url=diagnosis_format.airflow_run_url(dag_id, run_id),
-                )
-            }),
-            headers={"Content-Type": "application/json"},
-        )
-        print(f"[_add_duplicate_comment] Added occurrence comment to {ticket_key}")
-    except Exception as exc:
-        print(f"[_add_duplicate_comment] Could not comment on {ticket_key} (continuing): {exc}")
 
 
 @dag(
@@ -414,10 +493,36 @@ def agentic_incident_memory_v2():
         the recurrence context is guaranteed present without relying on the agent to look it up.
         Returns {"text": ..., "tickets": [...]}, both empty when there's no prior history (or if
         the memory is unavailable).
+
+        The recall is audited even though it takes no outward action. Whether the agent had prior
+        knowledge available is the difference between a cold diagnosis and a reused one, and
+        without a record of it "the memory is working" stays an assertion rather than a number.
         """
-        return incident_memory.recall_similar_incidents(
-            ctx["failed_dag_id"], ctx.get("task_logs", {})
-        )
+        failed_dag_id = ctx["failed_dag_id"]
+        failed_dag_run_id = ctx["failed_dag_run_id"]
+        result = incident_memory.recall_similar_incidents(failed_dag_id, ctx.get("task_logs", {}))
+
+        try:
+            audit = harness_audit.new_audit_log()
+            audit.record(
+                agent_id=harness_audit.DAG_ID,
+                action="recall_prior_incidents",
+                decision="allowed",
+                incident_id=f"{failed_dag_id}:{failed_dag_run_id}",
+                cohort=harness_audit.COHORT,
+                job_id=failed_dag_run_id,
+                outputs={
+                    "same_pipeline": result.get("tickets") or [],
+                    "other_pipelines": [r["key"] for r in (result.get("related") or [])],
+                    "open_duplicate": (result.get("open_duplicate") or {}).get("key"),
+                    "closed_recurrence": (result.get("closed_recurrence") or {}).get("key"),
+                },
+            )
+        except Exception as exc:
+            # Same best-effort contract as the memory itself: never break the incident flow.
+            print(f"[recall_prior_incidents] could not audit recall (continuing): {exc}")
+
+        return result
 
     @task.llm_branch(
         llm_conn_id="pydanticai_default",
@@ -644,7 +749,10 @@ def agentic_incident_memory_v2():
             f"may or may not be {ctx['failed_dag_id']}.py.\n\n"
             "Return the corrected file, in exactly this format (this is the final answer). "
             "[FILE_PATH] must contain ONLY the path, nothing else on that line:\n"
-            "[SUMMARY] one-line description of the fix\n"
+            "[SUMMARY] a SHORT title for the fix — under 90 characters, like a commit subject. "
+            "It becomes the pull-request title, read on its own in a list, so say what the change "
+            "does, not why. e.g. \"Write one CSV row per transaction\" or \"Add retry with backoff "
+            "to the sales_api call\". Not a sentence, not a paragraph. Never omit it.\n"
             "[FILE_PATH] dags/<filename>.py\n"
             "[NEW_CONTENT]\n"
             "<the complete corrected file content, and nothing else after this>"
@@ -828,7 +936,11 @@ def agentic_incident_memory_v2():
             f"{base_url}/pulls",
             headers=headers,
             json={
-                "title": f"fix({failed_dag_id}): {summary}",
+                # Scope the title by the pipeline being CHANGED, not the one that failed. Those
+                # differ whenever the root cause is upstream — a PR titled
+                # fix(novamart_transactions_load_qa) that only edits csv_export tells a reviewer
+                # the wrong thing before they open the diff.
+                "title": f"fix({_dag_id_from_path(file_path) or failed_dag_id}): {summary}",
                 "head": branch_name,
                 "base": default_branch,
                 "draft": True,
@@ -864,12 +976,34 @@ def agentic_incident_memory_v2():
         return result
 
     @task
-    def notify_slack_fix(pr: dict, diagnosis: str, failed_dag_id: str, failed_dag_run_id: str) -> dict:
-        """Post to Slack that a PR was opened (or, if GitHub isn't configured yet, that one
-        would have been). Returns pr unchanged so record_incident can link it."""
+    def notify_slack_fix(pr: dict, diagnosis: str, ctx: dict, prior_incidents: dict) -> dict:
+        """Open (or, on a still-open duplicate, comment on) a Jira ticket linking the PR, and post
+        a short, tagged Slack alert — same ticket/duplicate handling as the other two paths, so
+        every failure ends up tracked by a ticket regardless of which path handled it. Priority
+        follows the same critical/not-critical mapping as urgent_slack_post/create_ticket_low_priority.
+
+        Returns the ticket dict (with pr_url/pr_number folded in, and duplicate=True when no new
+        ticket was opened) so record_incident can link/record it.
+        """
+        failed_dag_id = ctx["failed_dag_id"]
+        failed_dag_run_id = ctx["failed_dag_run_id"]
         incident_id = f"{failed_dag_id}:{failed_dag_run_id}"
         audit = harness_audit.new_audit_log()
-        governor = harness_audit.new_action_governor({"messages_sent": 5})
+
+        # A failure the harness itself caused is a governance event, not a data incident: the
+        # control already prevented the harm, and the remedy is reverting a config value, not
+        # triaging a broken pipeline. Filing it into the incident queue puts work in front of
+        # someone that nobody needs to do, and mixes "a control fired" in with "the gold table
+        # is broken". It belongs on the harness console, which is the only place a fired control
+        # is legible at all -- so record it and stop, with no ticket and no Slack.
+        blocked_by = harness_audit.find_intervention(failed_dag_run_id)
+        if blocked_by:
+            print(f"[urgent_slack_post] {failed_dag_id} was stopped by the harness "
+                  f"({blocked_by['component']}: {blocked_by['prevented']}) — "
+                  f"governance event, no ticket and no Slack.")
+            return {"key": None, "url": None, "harness_intervention": blocked_by}
+
+        governor = harness_audit.new_action_governor({"tickets_created": 1, "messages_sent": 1})
 
         slack = SlackHook(slack_conn_id="slack_api")
         channel = Variable.get("SLACK_INCIDENT_CHANNEL", default="#qbiz_slackbot_testing")
@@ -877,16 +1011,38 @@ def agentic_incident_memory_v2():
         owner_mention = f"<@{owner_id}>" if owner_id else ""
 
         sections = diagnosis_format.parse_diagnosis(diagnosis)
-        links = [("View the failed Airflow run", diagnosis_format.airflow_run_url(failed_dag_id, failed_dag_run_id))]
-        if pr.get("url"):
-            links.insert(0, (f"PR #{pr.get('number')}: {pr.get('title', pr.get('summary', ''))}", pr["url"]))
-            severity = "fix"
+        open_duplicate = prior_incidents.get("open_duplicate")
+        priority = "Highest" if ctx.get("is_critical") else "Low"
+        pr_links = [(f"PR #{pr.get('number')}: {pr.get('title', pr.get('summary', ''))}", pr["url"])] if pr.get("url") else None
+
+        if open_duplicate:
+            # Already being worked: leave the ticket alone entirely. It is a human's
+            # workspace, and an agent appending a comment on every recurrence buries
+            # whatever the assignee wrote. Slack carries the recurrence; the audit trail
+            # carries the count.
+            ticket = {"key": open_duplicate["key"], "url": open_duplicate["url"], "duplicate": True}
+            print(f"[notify_slack_fix] {ticket['key']} is still open — no ticket, no comment.")
         else:
-            severity = "fix"  # GitHub not configured — still the FIX path, just without a PR link
+            harness_audit.guard_action(
+                governor, audit, kind="tickets_created", action="notify_slack_fix",
+                incident_id=incident_id, job_id=failed_dag_run_id,
+            )
+            ticket = _create_jira_ticket(
+                sections, dag_id=failed_dag_id, priority=priority,
+                summary_prefix="[Auto-fixed] ", extra_links=pr_links,
+                related=prior_incidents.get("related"),
+                recurrence_of=_closed_recurrence_of(prior_incidents),
+            )
+        ticket["pr_url"] = pr.get("url")
+        ticket["pr_number"] = pr.get("number")
+
+        links = list(pr_links or []) + [(f"Jira ticket {ticket['key']}", ticket["url"])]
+        links.append(("View the failed Airflow run", diagnosis_format.airflow_run_url(failed_dag_id, failed_dag_run_id)))
 
         blocks, fallback_text = diagnosis_format.build_incident_blocks(
-            severity=severity, dag_id=failed_dag_id, run_id=failed_dag_run_id,
+            severity="fix", dag_id=failed_dag_id, run_id=failed_dag_run_id,
             sections=sections, owner_mention=owner_mention, links=links,
+            duplicate_of=ticket["key"] if open_duplicate else None,
         )
 
         harness_audit.guard_action(
@@ -897,9 +1053,12 @@ def agentic_incident_memory_v2():
         audit.record(
             agent_id=harness_audit.DAG_ID, action="notify_slack_fix", decision="allowed",
             incident_id=incident_id, cohort=harness_audit.COHORT, job_id=failed_dag_run_id,
-            outputs={"channel": channel, "pr_url": pr.get("url")},
+            outputs={
+                "channel": channel, "pr_url": pr.get("url"),
+                "ticket_key": ticket["key"], "duplicate": bool(open_duplicate),
+            },
         )
-        return pr
+        return ticket
 
     @task
     def urgent_slack_post(diagnosis: str, failed_dag_id: str, failed_dag_run_id: str, prior_incidents: dict) -> dict:
@@ -913,6 +1072,20 @@ def agentic_incident_memory_v2():
         """
         incident_id = f"{failed_dag_id}:{failed_dag_run_id}"
         audit = harness_audit.new_audit_log()
+
+        # A failure the harness itself caused is a governance event, not a data incident: the
+        # control already prevented the harm, and the remedy is reverting a config value, not
+        # triaging a broken pipeline. Filing it into the incident queue puts work in front of
+        # someone that nobody needs to do, and mixes "a control fired" in with "the gold table
+        # is broken". It belongs on the harness console, which is the only place a fired control
+        # is legible at all -- so record it and stop, with no ticket and no Slack.
+        blocked_by = harness_audit.find_intervention(failed_dag_run_id)
+        if blocked_by:
+            print(f"[create_ticket_low_priority] {failed_dag_id} was stopped by the harness "
+                  f"({blocked_by['component']}: {blocked_by['prevented']}) — "
+                  f"governance event, no ticket and no Slack.")
+            return {"key": None, "url": None, "harness_intervention": blocked_by}
+
         governor = harness_audit.new_action_governor({"tickets_created": 1, "messages_sent": 1})
 
         slack = SlackHook(slack_conn_id="slack_api")
@@ -924,10 +1097,8 @@ def agentic_incident_memory_v2():
         open_duplicate = prior_incidents.get("open_duplicate")
 
         if open_duplicate:
+            # See notify_slack_fix: an open ticket is never written to.
             ticket = {"key": open_duplicate["key"], "url": open_duplicate["url"], "duplicate": True}
-            _add_duplicate_comment(
-                ticket["key"], dag_id=failed_dag_id, run_id=failed_dag_run_id, sections=sections,
-            )
             links = [
                 (f"Existing ticket {ticket['key']}", ticket["url"]),
                 ("View the failed Airflow run", diagnosis_format.airflow_run_url(failed_dag_id, failed_dag_run_id)),
@@ -942,7 +1113,11 @@ def agentic_incident_memory_v2():
                 governor, audit, kind="tickets_created", action="urgent_slack_post",
                 incident_id=incident_id, job_id=failed_dag_run_id,
             )
-            ticket = _create_jira_ticket(sections, priority="Highest")
+            ticket = _create_jira_ticket(
+                sections, dag_id=failed_dag_id, priority="Highest",
+                related=prior_incidents.get("related"),
+                recurrence_of=_closed_recurrence_of(prior_incidents),
+            )
             links = [
                 (f"Jira ticket {ticket['key']}", ticket["url"]),
                 ("View the failed Airflow run", diagnosis_format.airflow_run_url(failed_dag_id, failed_dag_run_id)),
@@ -971,6 +1146,16 @@ def agentic_incident_memory_v2():
         opening a second ticket. Only for non-critical pipelines."""
         incident_id = f"{failed_dag_id}:{failed_dag_run_id}"
         audit = harness_audit.new_audit_log()
+
+        # Same rule as the other two response paths: a failure the harness itself caused is a
+        # governance event, not a data incident. No ticket, no Slack — it belongs on the console.
+        blocked_by = harness_audit.find_intervention(failed_dag_run_id)
+        if blocked_by:
+            print(f"[create_ticket_low_priority] {failed_dag_id} was stopped by the harness "
+                  f"({blocked_by['component']}: {blocked_by['prevented']}) — "
+                  f"governance event, no ticket and no Slack.")
+            return {"key": None, "url": None, "harness_intervention": blocked_by}
+
         governor = harness_audit.new_action_governor({"tickets_created": 1, "messages_sent": 1})
 
         slack = SlackHook(slack_conn_id="slack_api")
@@ -982,10 +1167,8 @@ def agentic_incident_memory_v2():
         open_duplicate = prior_incidents.get("open_duplicate")
 
         if open_duplicate:
+            # See notify_slack_fix: an open ticket is never written to.
             ticket = {"key": open_duplicate["key"], "url": open_duplicate["url"], "duplicate": True}
-            _add_duplicate_comment(
-                ticket["key"], dag_id=failed_dag_id, run_id=failed_dag_run_id, sections=sections,
-            )
             links = [
                 (f"Existing ticket {ticket['key']}", ticket["url"]),
                 ("View the failed Airflow run", diagnosis_format.airflow_run_url(failed_dag_id, failed_dag_run_id)),
@@ -1000,7 +1183,11 @@ def agentic_incident_memory_v2():
                 governor, audit, kind="tickets_created", action="create_ticket_low_priority",
                 incident_id=incident_id, job_id=failed_dag_run_id,
             )
-            ticket = _create_jira_ticket(sections, priority="Low")
+            ticket = _create_jira_ticket(
+                sections, dag_id=failed_dag_id, priority="Low",
+                related=prior_incidents.get("related"),
+                recurrence_of=_closed_recurrence_of(prior_incidents),
+            )
             links = [
                 (f"Jira ticket {ticket['key']}", ticket["url"]),
                 ("View the failed Airflow run", diagnosis_format.airflow_run_url(failed_dag_id, failed_dag_run_id)),
@@ -1049,7 +1236,13 @@ def agentic_incident_memory_v2():
         # whether a PR URL came back. open_pr degrades to {"url": None} when github_api isn't
         # configured, and keying off the URL would mislabel that still-took-the-fix-path run as an
         # escalation in the audit trail.
-        if fix_result is not None:
+        if ticket_like.get("harness_intervention"):
+            # The harness stopped this one: no ticket, no Slack, nothing outward. It is still an
+            # incident worth counting, and the console is the only surface where a fired control
+            # is legible — so it gets its own path rather than being filed as a ticket that was
+            # never created.
+            path = "governance"
+        elif fix_result is not None:
             path = "fix"
         elif ticket is not None:
             path = "ticket"
@@ -1057,7 +1250,7 @@ def agentic_incident_memory_v2():
             path = "escalate"
 
         is_duplicate = bool(ticket_like.get("duplicate"))
-        if not is_duplicate:
+        if not is_duplicate and path != "governance":
             record_target = fix_result if (fix_result and fix_result.get("url")) else ticket_like
             incident_memory.record_incident(
                 failed_dag_id, failed_dag_run_id, diagnosis, record_target, status="open"
@@ -1095,7 +1288,7 @@ def agentic_incident_memory_v2():
 
     validated_fix = validate_proposed_fix(proposed_fix, ctx["failed_dag_id"], ctx["failed_dag_run_id"])
     pr = open_pr(validated_fix, diagnosis, ctx["failed_dag_id"], ctx["failed_dag_run_id"])
-    fix_result = notify_slack_fix(pr, diagnosis, ctx["failed_dag_id"], ctx["failed_dag_run_id"])
+    fix_result = notify_slack_fix(pr, diagnosis, ctx, prior)
 
     record_incident(
         diagnosis, ctx["failed_dag_id"], ctx["failed_dag_run_id"], fix_result, ticket, escalate_ticket

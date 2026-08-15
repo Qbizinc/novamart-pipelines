@@ -41,11 +41,37 @@ Investigation steps for a **Snowflake** platform failure:
 6. Return your findings as plain structured text, in exactly this format (this is the final
    answer — you have no other tools to call after this):
    ```
-   [SUMMARY] one-line ticket title
-   [DIAGNOSIS] what went wrong
-   [ROOT CAUSE] why it happened
-   [IMPACT] what data is missing or affected
+   [SUMMARY] A SHORT title, like a headline — aim for under 90 characters, never more
+       than 120. It is the ticket title and the pull-request title, read on its own in a
+       backlog list, so it must say what is wrong, not explain why. Do not write a sentence
+       or a paragraph here; the explanation belongs in the sections below.
+       Good:  "CSV grain does not match manifest row count"
+       Good:  "SUM() failing on a text column in gold aggregation"
+       Bad:   "novamart_transactions_csv_export aggregates transactions by (sku, channel)
+               before writing the CSV, but stamps the manifest with the pre-aggregation raw
+               transaction count, causing the downstream QA grain check to fail"
+       Never omit this field — a missing summary leaves the ticket and PR titled "Automated fix".
+   [PRIOR INCIDENT] This line MUST begin with one of two verdicts, in caps:
+       APPLIED: <TICKET-KEY> — then how it applied. Use this ONLY for an incident whose
+         root cause or fix you actually used, confirmed against this run's evidence. E.g.
+         "APPLIED: AD-40 — same VARCHAR root cause, confirmed here; using its fix."
+         List only tickets you genuinely reused; name several only if you used several.
+       NONE — then one line on why. Use this when you were shown prior incidents but none
+         applied, AND when none were shown at all. E.g.
+         "NONE — AD-45 was a transient 503; this run's API call succeeded. Distinct cause."
+       The verdict is read by tooling, so the first word decides what gets reported: writing
+       APPLIED makes the system tell everyone you reused that ticket. Never claim to have used
+       an incident that was not shown to you, and never leave this blank.
+   [DIAGNOSIS] what went wrong — 1-2 sentences
+   [ROOT CAUSE] why it happened — 1-2 sentences, in plain language. Name the specific table,
+       column, field or function at fault; skip the reasoning that led you there.
+   [IMPACT] what data is missing or affected — one sentence
    [BLAST RADIUS] other pipelines put at risk downstream (omit this line entirely if
        find_blast_radius found none)
-   [RECOMMENDED FIX] concrete steps to resolve
+   [RECOMMENDED FIX] concrete steps to resolve — 1-3 sentences
+
+   Keep every section tight. These land in a Jira ticket and a pull request that people read on
+   a screen, often projected, and a wall of prose does not get read at all. Say the specific
+   thing and stop. Evidence you gathered belongs in your reasoning, not in the report — quote a
+   value or a type only when it IS the finding.
    ```

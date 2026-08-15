@@ -41,6 +41,20 @@ When working on this code, know:
   cross-pipeline "all incidents" query is possible; it's the *recall scoping* that must use `dag_id`.)
 - The index persists under `RAG_DATA_DIR` (`include/.rag-incidents`, git-ignored). A different
   `RAG_DATA_DIR` = a different, empty memory.
+- **⚠️ One writer at a time.** The index is three plain files (`ledger.json`, `chunks.jsonl`,
+  `vectors.npy`) that each process loads into memory and rewrites **whole**. There is no locking
+  and no re-read on change, so two writers silently clobber each other: a `rag` MCP server started
+  before a demo holds a stale snapshot, and one write from it drops every incident the DAGs
+  recorded since it started. Observed in practice — a full run's incident records vanished this
+  way, leaving only the seeds.
+  - To clear/re-seed the memory, use `incident_memory.reset_to_seed()` **inside the Airflow
+    container** (the demo driver's `--reset-memory` flag does exactly this), never the MCP tools
+    while Airflow is running.
+  - The `rag` MCP server is fine for *reading* (the `rag-incident-memory` skill's on-call use), but
+    treat any MCP **write** as unsafe while the DAGs are live.
+- `SEED_INCIDENTS` in `incident_memory.py` is the only thing `reset_to_seed()` restores. A record
+  ingested by hand is **not** in there and will not survive a reset — if a baseline record matters,
+  it belongs in that list, keyed by a real Jira ticket (AD-40, AD-45).
 
 For **interactive / on-call** use (querying the incident memory yourself, outside the DAG), there's a
 skill for that: `qba agent skills add rag-incident-memory` (drives the `rag` MCP server directly).

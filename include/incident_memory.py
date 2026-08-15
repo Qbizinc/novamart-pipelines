@@ -46,8 +46,8 @@ def _symptom_from_logs(task_logs: dict[str, str]) -> str:
     return " ".join(tails)[:1500].strip()
 
 
-def _ledger_status(title: str) -> str | None:
-    """Best-effort direct read of the ledger for a hit's status tag ('open'/'closed').
+def _ledger_tags(title: str) -> list[str]:
+    """Best-effort direct read of a record's tags from the ledger.
 
     search() hits don't carry tags (only source/title/ordinal/score/text), so this reads the
     ledger file directly rather than adding an unverified method call onto the raw Index object —
@@ -57,11 +57,41 @@ def _ledger_status(title: str) -> str | None:
         ledger_path = os.path.join(os.environ["RAG_DATA_DIR"], "ledger.json")
         with open(ledger_path, encoding="utf-8") as f:
             ledger = json.load(f)
-        entry = ledger.get(f"text:{title}", {})
-        tags = entry.get("tags", [])
-        return "open" if "open" in tags else ("closed" if "closed" in tags else None)
+        return list(ledger.get(f"text:{title}", {}).get("tags", []))
     except Exception:
-        return None
+        return []
+
+
+def _ledger_status(title: str) -> str | None:
+    """'open'/'closed' from the tag stored on the record at ingest.
+
+    The status drives behaviour — an open incident dedupes and teaches nothing, a closed one
+    teaches and never dedupes — so this tag has to agree with the ticket tracker.
+
+    It is a snapshot, not a live read: nothing updates it after ingest, and record_incident()
+    always writes "open". So an incident the agent resolves later stays "open" here forever,
+    which means it will keep deduping to a fixed ticket and never graduate into knowledge.
+    That is fine while the knowledge base is the two curated seeds in SEED_INCIDENTS, whose
+    statuses are maintained by hand; it does not scale past them.
+
+    The fix is close-tracking — a sync that reconciles these tags with the tracker (see
+    RAG_INCIDENT_MEMORY_PLAN.md), or resolving status at read time instead of storing it. Either
+    way, the tracker owns state and this copy of it will drift until something reconciles them.
+    """
+    tags = _ledger_tags(title)
+    return "open" if "open" in tags else ("closed" if "closed" in tags else None)
+
+
+_STATUS_TAGS = {"open", "closed"}
+
+
+def _ledger_dag_id(title: str) -> str | None:
+    """Which pipeline a stored record belongs to. Records carry [INCIDENT_TAG, dag_id, status],
+    so the dag_id is whatever isn't the shared incident tag or a status tag."""
+    for tag in _ledger_tags(title):
+        if tag != INCIDENT_TAG and tag not in _STATUS_TAGS:
+            return tag
+    return None
 
 
 def recall_similar_incidents(dag_id: str, task_logs: dict[str, str], k: int = 3) -> dict:
@@ -74,19 +104,37 @@ def recall_similar_incidents(dag_id: str, task_logs: dict[str, str], k: int = 3)
     All fields are empty/None if there are no matches or on any error, so the investigation and
     ticket-creation flow both proceed normally.
     """
+    empty = {"text": "", "tickets": [], "open_duplicate": None,
+             "closed_recurrence": None, "related": []}
     try:
         symptom = _symptom_from_logs(task_logs)
-        # RAG tag filtering is ANY-of, so scope by the dag_id tag ALONE — in a dedicated incident
-        # index that uniquely selects this pipeline's incidents. Including INCIDENT_TAG here would
-        # broaden the match to *every* incident (via the shared 'incident' tag), which is wrong.
-        hits = _index().search(f"{dag_id} {symptom}".strip(), k=k, tags=[dag_id])
+        query = f"{dag_id} {symptom}".strip()
+
+        # TIER 1 — this pipeline's own history. RAG tag filtering is ANY-of, so scope by the
+        # dag_id tag ALONE; adding INCIDENT_TAG would broaden it to *every* incident.
+        # Only this tier can suppress a ticket: "same pipeline, same symptom" is a recurrence.
+        hits = _index().search(query, k=k, tags=[dag_id])
+
+        # TIER 2 — everything else. A similar failure on a DIFFERENT pipeline is a lead worth
+        # reading (often the same root cause and the same fix), but it is never the same incident,
+        # so these are hints only and can never dedupe a ticket. Merging incidents across
+        # pipelines on semantic similarity alone is how a real outage gets filed as a duplicate
+        # and silently dropped.
+        cross_hits = _index().search(query, k=k + 3, tags=[INCIDENT_TAG])
     except Exception as exc:  # best-effort — never block the investigation
         print(f"[incident_memory] recall failed (continuing without prior context): {exc}")
-        return {"text": "", "tickets": [], "open_duplicate": None}
+        return empty
+
+    related = _cross_pipeline_hints(cross_hits, exclude_dag_id=dag_id)
 
     if not hits:
         print(f"[incident_memory] no prior incidents on record for {dag_id}")
-        return {"text": "", "tickets": [], "open_duplicate": None}
+        if not related:
+            return empty
+        print(f"[incident_memory] {len(related)} similar incident(s) on OTHER pipelines: "
+              f"{[r['key'] for r in related]}")
+        return {"text": _render_related_section(related), "tickets": [],
+                "open_duplicate": None, "closed_recurrence": None, "related": related}
 
     # hits are per-chunk, not per-source: a record split into several chunks can match more than
     # once, each with the same title. Dedupe by title (keeping the first/highest-relevance
@@ -103,31 +151,139 @@ def recall_similar_incidents(dag_id: str, task_logs: dict[str, str], k: int = 3)
 
     print(f"[incident_memory] {len(unique_hits)} prior incident(s) for {dag_id}: "
           f"{[h.get('title') for h in unique_hits]}")
-    lines = [
-        "Prior incidents on this pipeline (from incident memory — treat each as a LEAD to confirm "
-        "against the current evidence, not as established fact):",
-    ]
-    for h in unique_hits:
+
+    # Only RESOLVED incidents become knowledge. An open ticket on this pipeline is still being
+    # worked — it holds a symptom, not an answer — so it feeds duplicate detection below and
+    # nothing else. Showing one to the agent would invite it to present someone's unfinished
+    # investigation as a confirmed fix.
+    resolved = [h for h in unique_hits if _ledger_status(h.get("title")) == "closed"]
+    skipped_open = len(unique_hits) - len(resolved)
+    if skipped_open:
+        print(f"[incident_memory] ignoring {skipped_open} unresolved prior incident(s) as a "
+              f"knowledge source (still open — no resolution to reuse)")
+
+    lines = []
+    if resolved:
         lines.append(
-            f"\n--- {h.get('title', '?')} (similarity {h.get('score', 0.0):.2f}) ---\n"
-            f"{(h.get('text') or '').strip()[:800]}"
+            "Prior RESOLVED incidents on this pipeline (from incident memory — each was fixed and "
+            "closed. Treat each as a LEAD to confirm against the current evidence, not as "
+            "established fact):"
         )
-    tickets = [h["title"] for h in unique_hits if h.get("title")]
+        for h in resolved:
+            lines.append(
+                f"\n--- {h.get('title', '?')} (similarity {h.get('score', 0.0):.2f}) ---\n"
+                f"{(h.get('text') or '').strip()[:800]}"
+            )
+    tickets = [h["title"] for h in resolved if h.get("title")]
 
     open_duplicate = None
+    closed_recurrence = None
     top = unique_hits[0]
     top_title = top.get("title")
     top_score = top.get("score", 0.0)
-    if top_title and top_score >= DUPLICATE_SCORE_THRESHOLD and _ledger_status(top_title) == "open":
-        open_duplicate = {
-            "key": top_title,
-            "url": f"https://qbizinc.atlassian.net/browse/{top_title}",
-            "score": top_score,
-        }
-        print(f"[incident_memory] treating this as a recurrence of open ticket {top_title} "
-              f"(score={top_score:.2f} >= {DUPLICATE_SCORE_THRESHOLD})")
+    top_status = _ledger_status(top_title) if top_title else None
 
-    return {"text": "\n".join(lines), "tickets": tickets, "open_duplicate": open_duplicate}
+    if top_title and top_score >= DUPLICATE_SCORE_THRESHOLD:
+        if top_status == "open":
+            open_duplicate = {
+                "key": top_title,
+                "url": f"https://qbizinc.atlassian.net/browse/{top_title}",
+                "score": top_score,
+            }
+            print(f"[incident_memory] treating this as a recurrence of open ticket {top_title} "
+                  f"(score={top_score:.2f} >= {DUPLICATE_SCORE_THRESHOLD})")
+        elif top_status == "closed":
+            # A closed incident recurring is a NEW incident, not a duplicate: the original has a
+            # finished timeline someone signed off on, and reopening it would blur two separate
+            # occurrences into one record. Open a fresh ticket that cites the original instead.
+            closed_recurrence = {
+                "key": top_title,
+                "url": f"https://qbizinc.atlassian.net/browse/{top_title}",
+                "score": top_score,
+            }
+            print(f"[incident_memory] recurrence of CLOSED ticket {top_title} "
+                  f"(score={top_score:.2f}) — will open a new ticket citing it")
+
+    if related:
+        print(f"[incident_memory] {len(related)} resolved incident(s) on OTHER pipelines: "
+              f"{[r['key'] for r in related]}")
+        lines.append(_render_related_section(related))
+
+    # An open duplicate means this is already being worked. Hand back no knowledge at all in that
+    # case — the response is "comment on the existing ticket", not "diagnose it again from a
+    # half-finished record".
+    text = "" if open_duplicate else "\n".join(lines)
+
+    return {"text": text, "tickets": tickets, "open_duplicate": open_duplicate,
+            "closed_recurrence": closed_recurrence,
+            "related": [] if open_duplicate else related}
+
+
+# How close a cross-pipeline incident has to be before it is worth showing the agent at all.
+#
+# Calibrated against observed pairs rather than guessed. Embeddings of incident text share a lot
+# of pipeline vocabulary, so scores run high across the board and a low floor admits almost
+# anything: at 0.40, a row-count grain mismatch pulled in a 503 outage at 0.70 — unrelated in
+# every respect, and the agent then had to spend reasoning disproving it. Measured on this index:
+#
+#   0.83  same failure, same pipeline        (503 -> AD-45)          genuinely a recurrence
+#   0.78  same failure, different pipeline   (503 -> AD-45)          genuinely transferable
+#   0.70  unrelated failure                  (grain check -> AD-45)  noise
+#
+# 0.75 keeps the first two and drops the third. A weak match is worse than no match: it anchors
+# the agent on a wrong hypothesis, so this floor is deliberately conservative. Revisit with more
+# data — three points is a calibration, not a study.
+RELATED_SCORE_THRESHOLD = 0.75
+
+
+def _cross_pipeline_hints(hits: list[dict], *, exclude_dag_id: str) -> list[dict]:
+    """Distinct RESOLVED incidents from OTHER pipelines, best first.
+
+    Closed only, deliberately. An open ticket has no resolution written into it yet — there is
+    nothing in it to reuse, and offering one as a "similar incident" invites the agent to infer a
+    fix nobody has actually confirmed. Open tickets earn their keep as duplicate detection
+    (same pipeline, see open_duplicate); knowledge transfer is the job of closed ones.
+
+    The source pipeline does not have to still exist: a resolved incident on a since-renamed or
+    deleted DAG is exactly as instructive as one on a live pipeline.
+    """
+    seen: set[str] = set()
+    out: list[dict] = []
+    for h in hits or []:
+        title = h.get("title")
+        if not title or title in seen:
+            continue
+        if h.get("score", 0.0) < RELATED_SCORE_THRESHOLD:
+            continue
+        if _ledger_status(title) != "closed":
+            continue  # unresolved — nothing to learn from it
+        hit_dag_id = _ledger_dag_id(title)
+        if hit_dag_id == exclude_dag_id:
+            continue  # same pipeline — tier 1 already covers it
+        seen.add(title)
+        out.append({
+            "key": title,
+            "dag_id": hit_dag_id,
+            "score": h.get("score", 0.0),
+            "text": (h.get("text") or "").strip()[:800],
+        })
+    return out
+
+
+def _render_related_section(related: list[dict]) -> str:
+    """Prompt section for tier-2 hits, worded so the agent treats them as transferable *approaches*
+    rather than as this pipeline's own history."""
+    lines = [
+        "\nSimilar incidents on OTHER pipelines (different systems, so NOT a recurrence of this "
+        "one — but the root cause and fix may transfer. If one applies, say so explicitly and name "
+        "the ticket; if none do, say that too):",
+    ]
+    for r in related:
+        lines.append(
+            f"\n--- {r['key']} on {r.get('dag_id') or 'unknown pipeline'} "
+            f"(similarity {r['score']:.2f}) ---\n{r['text']}"
+        )
+    return "\n".join(lines)
 
 
 def build_record(dag_id: str, run_id: str, diagnosis: str, ticket: dict) -> str:
@@ -178,7 +334,11 @@ SEED_INCIDENTS: list[dict] = [
     {
         "dag_id": "novamart_gold_sales_by_region",
         "key": "AD-40",
-        "status": "closed",
+        # Mirrors AD-40's real Jira status (To Do). The status here drives behaviour — an open
+        # ticket dedupes and teaches nothing, a closed one teaches and never dedupes — so a tag
+        # that disagrees with Jira makes the agent act on a false premise. Nothing syncs these
+        # automatically yet; if AD-40 is resolved in Jira, flip this to "closed" too.
+        "status": "open",
         "text": (
             "[SUMMARY] novamart_gold_sales_by_region failed — SUM() error on a column expected to be numeric\n"
             "[DIAGNOSIS] The gold aggregation task failed running SUM() over a column sourced from "
@@ -193,6 +353,28 @@ SEED_INCIDENTS: list[dict] = [
             "[RECOMMENDED FIX] Compare BRONZE_SALES's current column types/sample values against "
             "what novamart_bronze_sales defines, focusing on whatever column the failing aggregation "
             "uses. Rebuild BRONZE_SALES with that column restored to its correct numeric type."
+        ),
+    },
+    {
+        # Pairs with the sales_api leg of the demo sequence (the mock is toggled unhealthy so the
+        # ingest fails on 503s), giving that pipeline a prior incident to recall on its first
+        # failure. AD-45 is a real Jira ticket, like AD-40 — it previously lived in the index as a
+        # hand-ingested record keyed "AD-1005", which nothing in code recreated, so reset_to_seed()
+        # silently dropped it.
+        "dag_id": "novamart_sales_api_ingest",
+        "key": "AD-45",
+        "status": "closed",
+        "text": (
+            "[SUMMARY] novamart_sales_api_ingest failed — sales_api returned connection errors on "
+            "every request\n"
+            "[DIAGNOSIS] fetch_transactions raised a connection/HTTP error calling sales_api's "
+            "/api/v1/sales endpoint; every request during this run failed the same way.\n"
+            "[ROOT CAUSE] sales_api's upstream load balancer was mid-rollout (a deploy in progress) "
+            "and returned 503s for several minutes — not a bug in this pipeline's own code.\n"
+            "[IMPACT] No transactions fetched for this run; downstream load did not occur.\n"
+            "[FIX] Wrapped the sales_api request in a short retry with backoff (2-3 attempts, short "
+            "delay between). That resolved it — the pipeline now tolerates a brief upstream blip "
+            "instead of failing the whole run on the first error."
         ),
     },
 ]
@@ -212,7 +394,7 @@ def seed() -> None:
 
 def reset_to_seed() -> None:
     """Wipe every incident record and re-seed just the real baseline ticket(s) in SEED_INCIDENTS,
-    so the index starts from the same known state instead of accumulating test/demo tickets.
+    so the index starts from the same known state instead of accumulating stale records.
 
     Deletes the on-disk index files directly rather than removing sources one by one — ingest()
     is the only index-mutation entry point this module otherwise relies on, and a missing index
