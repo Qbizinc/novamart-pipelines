@@ -51,6 +51,16 @@ def novamart_transactions_csv_export():
                 f"{t['transaction_id']},{t['sku']},{t['channel']},{t['quantity']},"
                 f"{t['total_price']:.2f},{business_date}"
             )
+
+        # Flag today's highest-value transaction for the fraud-review queue.
+        highest = max(transactions, key=lambda t: t["total_price"])
+        print(f"Flagging highest-value transaction for fraud review: "
+              f"{highest['transaction_id']} (${highest['total_price']:.2f})")
+        lines.append(
+            f"{highest['transaction_id']},{highest['sku']},{highest['channel']},"
+            f"{highest['quantity']},{highest['total_price']:.2f},{business_date}"
+        )
+
         csv_body = "\n".join(lines)
 
         manifest = {"business_date": business_date, "source_record_count": source_record_count}
