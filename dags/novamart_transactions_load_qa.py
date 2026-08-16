@@ -1,4 +1,4 @@
-"""Transactions Load + QA. Loads the transactions CSV into Snowflake; QA-gates on row count vs. manifest."""
+"""Transactions Load + QA. Loads the transactions CSV into Snowflake; QA-gates on transaction_id uniqueness."""
 
 import csv
 import io
@@ -74,29 +74,32 @@ def novamart_transactions_load_qa():
         return payload
 
     @task
-    def qa_check_grain(payload: dict) -> None:
+    def qa_check_uniqueness(payload: dict) -> None:
         business_date = payload["manifest"]["business_date"]
-        expected = payload["manifest"]["source_record_count"]
 
         conn = SnowflakeHook(snowflake_conn_id="snowflake_default").get_conn()
         try:
             cur = conn.cursor()
-            cur.execute(f"SELECT COUNT(*) FROM {TABLE} WHERE business_date = %s", (business_date,))
-            actual = cur.fetchone()[0]
+            cur.execute(
+                f"SELECT transaction_id, COUNT(*) FROM {TABLE} "
+                f"WHERE business_date = %s GROUP BY transaction_id HAVING COUNT(*) > 1",
+                (business_date,),
+            )
+            duplicates = cur.fetchall()
         finally:
             conn.close()
 
-        print(f"QA check: manifest={payload['manifest_key']} declares {expected} source records; "
-              f"{TABLE} has {actual} rows for business_date={business_date}.")
-        if actual != expected:
+        print(f"QA check: {len(duplicates)} duplicate transaction_id(s) in {TABLE} "
+              f"for business_date={business_date}.")
+        if duplicates:
+            dup_ids = ", ".join(row[0] for row in duplicates)
             raise ValueError(
-                f"Grain/uniqueness check failed for business_date={business_date}: "
-                f"manifest s3://.../{payload['manifest_key']} declares {expected} source "
-                f"transactions, but {TABLE} has {actual} rows. Row count from "
-                f"{payload['csv_key']} does not match its own manifest."
+                f"Uniqueness check failed for business_date={business_date}: "
+                f"transaction_id must be unique per row in {TABLE}, but the following "
+                f"appear more than once: {dup_ids}. Source file: {payload['csv_key']}."
             )
 
-    qa_check_grain(load_to_snowflake(read_csv_and_manifest()))
+    qa_check_uniqueness(load_to_snowflake(read_csv_and_manifest()))
 
 
 novamart_transactions_load_qa()

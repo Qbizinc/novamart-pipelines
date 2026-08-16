@@ -144,6 +144,7 @@ def build_incident_blocks(
     owner_mention: str = "",
     links: list[tuple[str, str]] | None = None,
     duplicate_of: str | None = None,
+    recurrence_of: str | None = None,
 ) -> tuple[list[dict], str]:
     """Build a short Slack Block Kit alert for one incident notification.
 
@@ -151,6 +152,15 @@ def build_incident_blocks(
     summary, and links to the Jira ticket / PR / Airflow run. Root cause, impact, and recommended
     fix are NOT repeated here; those live in the Jira ticket description or PR body, which are the
     comprehensive record for root-cause analysis.
+
+    recurrence_of is the SAME fact the Jira ticket's "Prior Knowledge Used" section carries (see
+    build_adf_description) — a deterministic, score-based match against a CLOSED prior incident,
+    computed in code before the agent ever runs. It is independent of whatever the agent itself
+    writes in [PRIOR INCIDENT]: an agent can reasonably hedge to "NONE" there (e.g. it wants task
+    logs it wasn't given before confirming the root cause matches) while still citing that prior
+    incident's fix in its own [RECOMMENDED FIX] — the memory did its job either way. Without this
+    parameter, that fact only ever reached Jira; Slack showed nothing unless the agent's own prose
+    happened to name the ticket and wasn't read as a rejection by reused_ticket_keys.
 
     Returns (blocks, fallback_text) — Slack requires a plain-text `text` alongside `blocks` for
     notifications/screen readers, so both are returned together.
@@ -197,10 +207,18 @@ def build_incident_blocks(
     # Slack is an alert, not a record: just the ticket keys, no prose. The reasoning behind the
     # reuse belongs in the Jira description and the PR body, which are where someone goes to
     # actually evaluate it — repeating it here only makes the alert longer to skim.
+    #
+    # Two independent sources feed this line, and neither should be silenced by the other's
+    # absence: recurrence_of is the system's own score-based finding (a fact, true regardless of
+    # what the agent wrote); reused_keys is the agent's account of what it actually used. A
+    # recurrence with no reused_keys (the agent hedged to NONE) still deserves the line — the
+    # system found a match even if the agent wouldn't commit to it without more evidence.
     reused_keys = reused_ticket_keys(sections.get("prior_incident"))
-    if reused_keys and not duplicate_of:
+    memory_keys = ([recurrence_of] if recurrence_of else []) + [k for k in reused_keys if k != recurrence_of]
+    if memory_keys and not duplicate_of:
+        label = "Recurrence of" if memory_keys == [recurrence_of] else "Reused"
         blocks.append({"type": "context", "elements": [
-            {"type": "mrkdwn", "text": f":brain: Reused {', '.join(reused_keys)} — see ticket"},
+            {"type": "mrkdwn", "text": f":brain: {label} {', '.join(memory_keys)} — see ticket"},
         ]})
 
     for text, url in (links or []):

@@ -43,13 +43,19 @@ Investigation steps for a **Snowflake** platform failure:
    ```
    [SUMMARY] A SHORT title, like a headline — aim for under 90 characters, never more
        than 120. It is the ticket title and the pull-request title, read on its own in a
-       backlog list, so it must say what is wrong, not explain why. Do not write a sentence
-       or a paragraph here; the explanation belongs in the sections below.
-       Good:  "CSV grain does not match manifest row count"
-       Good:  "SUM() failing on a text column in gold aggregation"
-       Bad:   "novamart_transactions_csv_export aggregates transactions by (sku, channel)
-               before writing the CSV, but stamps the manifest with the pre-aggregation raw
-               transaction count, causing the downstream QA grain check to fail"
+       backlog list and sometimes seen by people who aren't debugging it themselves — so
+       name the CATEGORY of problem, not the mechanism. Do not name specific columns,
+       fields, functions, keys, or explain how the check works internally; that level of
+       detail belongs in [DIAGNOSIS]/[ROOT CAUSE] below, for the audience actually fixing
+       it. Do not write a sentence or a paragraph here.
+       Good:  "Row count validation failed after load"
+       Good:  "Aggregation error on a numeric column"
+       Good:  "Upstream API returned malformed data"
+       Bad:   "novamart_widget_ingest fetches records in pages of 100, but the retry
+               wrapper resets the page cursor to 0 on every retry instead of resuming
+               from where it left off, so records get re-inserted and violate the target
+               table's uniqueness constraint" — explains the mechanism; save that for
+               [DIAGNOSIS], where the reader actually needs it.
        Never omit this field — a missing summary leaves the ticket and PR titled "Automated fix".
    [PRIOR INCIDENT] This line MUST begin with one of two verdicts, in caps:
        APPLIED: <TICKET-KEY> — then how it applied. Use this ONLY for an incident whose
@@ -62,9 +68,21 @@ Investigation steps for a **Snowflake** platform failure:
        The verdict is read by tooling, so the first word decides what gets reported: writing
        APPLIED makes the system tell everyone you reused that ticket. Never claim to have used
        an incident that was not shown to you, and never leave this blank.
-   [DIAGNOSIS] what went wrong — 1-2 sentences
-   [ROOT CAUSE] why it happened — 1-2 sentences, in plain language. Name the specific table,
-       column, field or function at fault; skip the reasoning that led you there.
+   [DIAGNOSIS] What went wrong — ONE sentence, never two. State the failure itself, not the
+       mechanism behind it (that's ROOT CAUSE, below).
+   [ROOT CAUSE] Why it happened — ONE sentence, never two, in plain prose. Name the specific
+       table/column/field/function at fault by its identifier, but describe the defect in
+       words. Do not paste a code expression, dict literal, or tuple into the sentence (e.g.
+       `(sku, channel)`, `manifest["x"] = len(y)`) — a reviewer reads this in a ticket list,
+       not a diff, and code syntax stitched into prose reads as denser than the actual finding
+       warrants. Skip the reasoning that led you there.
+       Good:  "The write step groups rows before writing, but the row count recorded
+               alongside them is never updated to match the grouped total."
+       Bad:   "write_csv_and_manifest groups fetched transactions by (sku, channel) and sums
+               quantity/total_price into one row per group, but sets
+               manifest['source_record_count'] = len(transactions) instead of len(groups),
+               and each grouped row inherits transaction_id from only the first transaction
+               in that group."
    [IMPACT] what data is missing or affected — one sentence
    [BLAST RADIUS] other pipelines put at risk downstream (omit this line entirely if
        find_blast_radius found none)

@@ -1043,6 +1043,7 @@ def agentic_incident_memory_v2():
             severity="fix", dag_id=failed_dag_id, run_id=failed_dag_run_id,
             sections=sections, owner_mention=owner_mention, links=links,
             duplicate_of=ticket["key"] if open_duplicate else None,
+            recurrence_of=_closed_recurrence_of(prior_incidents),
         )
 
         harness_audit.guard_action(
@@ -1125,6 +1126,7 @@ def agentic_incident_memory_v2():
             blocks, fallback_text = diagnosis_format.build_incident_blocks(
                 severity="critical", dag_id=failed_dag_id, run_id=failed_dag_run_id,
                 sections=sections, owner_mention=owner_mention, links=links,
+                recurrence_of=_closed_recurrence_of(prior_incidents),
             )
 
         harness_audit.guard_action(
@@ -1195,6 +1197,7 @@ def agentic_incident_memory_v2():
             blocks, fallback_text = diagnosis_format.build_incident_blocks(
                 severity="ticket", dag_id=failed_dag_id, run_id=failed_dag_run_id,
                 sections=sections, owner_mention=owner_mention, links=links,
+                recurrence_of=_closed_recurrence_of(prior_incidents),
             )
 
         harness_audit.guard_action(
