@@ -191,13 +191,19 @@ def build_incident_blocks(
     if duplicate_of:
         # Slack is the ONLY output for a recurrence of an open incident — the ticket is left
         # untouched, so this line has to carry the whole story: what happened, that it is already
-        # tracked, and that nothing was created.
+        # tracked, and that nothing was created. Investigation still ran in full for this run
+        # (see recall_prior_incidents / investigate_*) even though nothing new gets filed, so the
+        # summary is shown here too — otherwise this reads as a bare non-event instead of "we
+        # looked, confirmed it's the same known issue, here's what it is."
+        summary = sections.get("summary") or sections.get("diagnosis", "")[:200]
+        confirmed_line = f"\n{summary}" if summary else ""
         blocks.append({
             "type": "section",
             "text": {
                 "type": "mrkdwn",
                 "text": f"*Already tracked* — this is a recurrence of `{duplicate_of}`, which is "
-                        f"still open. No new ticket created and the ticket was not modified.",
+                        f"still open. No new ticket created and the ticket was not modified."
+                        f"{confirmed_line}",
             },
         })
     else:

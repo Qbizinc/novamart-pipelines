@@ -685,11 +685,14 @@ def agentic_incident_memory_v2():
             "on (e.g. an upstream producer), if the diagnosis traced the defect to that "
             "pipeline's own code — propose_code_fix has a tool to fetch and fix that other "
             "pipeline's real file too, it is not limited to editing only the failed pipeline. "
-            "NOT eligible for propose_code_fix, regardless of which pipeline: a fix that would "
+            "NOT eligible for propose_code_fix, regardless of which pipeline: (1) a fix that would "
             "weaken, remove, or work around a validation/QA/uniqueness/grain check to make the "
             "failure stop, rather than fixing what the check correctly caught — that check is "
             "doing its job; if the only available 'fix' is loosening the check, this is not a "
-            "fixable code bug, route to urgent_slack_post/create_ticket_low_priority instead.\n"
+            "fixable code bug; (2) an AUTOMATED CHECK below shows this pipeline already has an "
+            "open ticket for this exact issue — writing a fix proposal for something already "
+            "being tracked adds cost and risk for no benefit. Route to "
+            "urgent_slack_post/create_ticket_low_priority instead in either case.\n"
             "- urgent_slack_post: (if not already routed here by the blast radius rule above) the "
             "pipeline is marked CRITICAL AND the root cause is NOT a fixable code bug (e.g. "
             "expired credentials, access denied, an upstream service down, external schema drift, "
@@ -702,14 +705,25 @@ def agentic_incident_memory_v2():
             "Route to exactly one of these three tasks."
         ),
     )
-    def decide_path(diagnosis: str, ctx: dict, cross_ref_note: str, blast_radius_note: str) -> str:
+    def decide_path(
+        diagnosis: str, ctx: dict, cross_ref_note: str, blast_radius_note: str, prior_incidents: dict
+    ) -> str:
         """Return the prompt for the fix/escalate/ticket branch decision."""
         criticality = "CRITICAL pipeline" if ctx.get("is_critical") else "not marked critical"
         note_section = f"\n\n{cross_ref_note}" if cross_ref_note else ""
         blast_section = f"\n\n{blast_radius_note}" if blast_radius_note else ""
+        open_duplicate = prior_incidents.get("open_duplicate")
+        duplicate_section = ""
+        if open_duplicate:
+            duplicate_section = (
+                f"\n\nAUTOMATED CHECK (not an opinion, a fact): this pipeline already has an "
+                f"open ticket for this exact issue — {open_duplicate['key']}, still open. The "
+                f"response tasks already know to cite {open_duplicate['key']} instead of opening "
+                f"a new one; propose_code_fix is not eligible here (see rule above)."
+            )
         return (
             f"Pipeline: {ctx['failed_dag_id']} ({criticality})\n\nDiagnosis:\n{diagnosis}"
-            f"{note_section}{blast_section}"
+            f"{note_section}{blast_section}{duplicate_section}"
         )
 
     @task.agent(
@@ -733,9 +747,13 @@ def agentic_incident_memory_v2():
             f"```python\n{ctx.get('dag_source', '')}\n```\n\n"
             "The bug may be in this file, or — if the diagnosis traces the root cause to a "
             "different pipeline (e.g. an upstream producer) — in that pipeline's own file "
-            "instead. If so, use list_dag_ids/get_dag_source to fetch that pipeline's REAL "
+            "instead. If so, use list_dag_ids/get_dag_source to fetch that ONE pipeline's REAL "
             "current source before proposing anything against it. Never invent or guess file "
-            "content you have not actually fetched.\n\n"
+            "content you have not actually fetched. Fetch at most one other pipeline's source — "
+            "the diagnosis above already names which file is at fault; do not speculatively pull "
+            "every pipeline in the chain (e.g. bronze AND silver AND gold) to double-check, that "
+            "wastes context on files you don't need and risks failing before producing an answer "
+            "at all.\n\n"
             "Do not weaken, remove, or work around any validation/QA/uniqueness/grain check "
             "(any assertion, raise, or comparison that gates data quality) to make the failure "
             "stop. Those checks exist to catch real problems. If two values are expected to "
@@ -1283,7 +1301,7 @@ def agentic_incident_memory_v2():
     cross_ref_note = check_cross_pipeline_reference(diagnosis, ctx)
     blast_radius_note = check_blast_radius(ctx)
 
-    decision = decide_path(diagnosis, ctx, cross_ref_note, blast_radius_note)
+    decision = decide_path(diagnosis, ctx, cross_ref_note, blast_radius_note, prior)
     proposed_fix = propose_code_fix(ctx, diagnosis)
     escalate_ticket = urgent_slack_post(diagnosis, ctx["failed_dag_id"], ctx["failed_dag_run_id"], prior)
     ticket = create_ticket_low_priority(diagnosis, ctx["failed_dag_id"], ctx["failed_dag_run_id"], prior)
