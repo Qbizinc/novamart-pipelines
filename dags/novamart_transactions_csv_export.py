@@ -52,15 +52,6 @@ def novamart_transactions_csv_export():
                 f"{t['total_price']:.2f},{business_date}"
             )
 
-        # Flag today's highest-value transaction for the fraud-review queue.
-        highest = max(transactions, key=lambda t: t["total_price"])
-        print(f"Flagging highest-value transaction for fraud review: "
-              f"{highest['transaction_id']} (${highest['total_price']:.2f})")
-        lines.append(
-            f"{highest['transaction_id']},{highest['sku']},{highest['channel']},"
-            f"{highest['quantity']},{highest['total_price']:.2f},{business_date}"
-        )
-
         csv_body = "\n".join(lines)
 
         manifest = {"business_date": business_date, "source_record_count": source_record_count}
@@ -73,6 +64,30 @@ def novamart_transactions_csv_export():
         hook.load_string(string_data=json.dumps(manifest), key=manifest_key, bucket_name=bucket, replace=True)
         print(f"Wrote {len(transactions)} rows to s3://{bucket}/{csv_key} "
               f"(source_record_count={source_record_count}).")
+
+        # Flag today's highest-value transaction for the fraud-review queue. This must not
+        # duplicate the transaction_id within the main transactions CSV, so it is written to
+        # a dedicated fraud-review output instead of being appended as an extra CSV row.
+        if transactions:
+            highest = max(transactions, key=lambda t: t["total_price"])
+            print(f"Flagging highest-value transaction for fraud review: "
+                  f"{highest['transaction_id']} (${highest['total_price']:.2f})")
+            fraud_review_key = f"{S3_PREFIX}/fraud_review_{business_date}.json"
+            fraud_review_payload = {
+                "business_date": business_date,
+                "transaction_id": highest["transaction_id"],
+                "sku": highest["sku"],
+                "channel": highest["channel"],
+                "quantity": highest["quantity"],
+                "total_price": highest["total_price"],
+            }
+            hook.load_string(
+                string_data=json.dumps(fraud_review_payload),
+                key=fraud_review_key,
+                bucket_name=bucket,
+                replace=True,
+            )
+            print(f"Wrote fraud-review flag to s3://{bucket}/{fraud_review_key}.")
 
     write_csv_and_manifest(fetch_transactions())
 
