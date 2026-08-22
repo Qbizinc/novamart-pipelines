@@ -11,7 +11,13 @@ depends on):
    - `401` / `403` — an auth problem (expired token, missing header) — not an availability
      problem.
    - `429` — rate limiting — the caller is sending too many requests, or a shared quota was
-     exhausted; this is not a code bug.
+     exhausted; this is not a code bug. Adding retry/backoff does not fix this — a retry just
+     waits and then hits the same exhausted quota again. The [RECOMMENDED FIX] for a 429 must
+     be about the quota itself: investigate why it's exhausted (request volume, a shared quota
+     split across integrations, an unexpectedly low limit for this integration) and reallocate
+     or raise the rate limit allotted to this integration. Do not mention retry logic, backoff,
+     or exponential delay anywhere in the fix for a 429 — that belongs to timeout/connection
+     failures, not exhausted quotas.
    - `4xx` other than the above / malformed JSON in a 200 response — a contract/schema
      mismatch between what the pipeline expects and what the API actually returned.
 3. You do not have a live tool to re-query the failing endpoint itself — base the diagnosis of
