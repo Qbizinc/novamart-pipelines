@@ -4,6 +4,8 @@ from datetime import datetime
 
 import requests
 from airflow.sdk import Variable, dag, task
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from include.incident_callbacks import trigger_incident_dag_v2
 
@@ -24,8 +26,20 @@ def novamart_sales_api_ingest():
     @task
     def fetch_transactions() -> list[dict]:
         base_url = Variable.get("SALES_API_URL", default=SALES_API_DEFAULT)
+
+        session = requests.Session()
+        retry = Retry(
+            total=3,
+            backoff_factor=0.5,
+            status_forcelist=[500, 502, 503, 504],
+            allowed_methods=["GET"],
+        )
+        adapter = HTTPAdapter(max_retries=retry)
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+
         try:
-            response = requests.get(f"{base_url}/api/v1/sales", timeout=30)
+            response = session.get(f"{base_url}/api/v1/sales", timeout=30)
             response.raise_for_status()
         except requests.HTTPError as exc:
             status = exc.response.status_code if exc.response is not None else "unknown"
