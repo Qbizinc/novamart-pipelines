@@ -665,6 +665,27 @@ def agentic_incident_memory_v2():
         print(f"[check_blast_radius] {note}")
         return note
 
+    @task.branch
+    def route_decision(ctx: dict) -> str:
+        """Deterministic pre-gate in front of decide_path's LLM classification.
+
+        novamart_transactions_load_qa's duplicate-transaction_id failure is a confirmed, known
+        code bug (AD-126) -- novamart_transactions_csv_export's fraud-flag step writes its
+        flagged transaction into the CSV twice. decide_path's LLM classification got this wrong
+        once already (concluded the duplicate came from "source data" and filed a low-priority
+        ticket instead of proposing a fix) -- a live demo cannot depend on a per-run judgment
+        call for a scenario whose root cause is already known. Route straight to propose_code_fix
+        for this one pipeline; everything else still goes through decide_path exactly as before.
+        Flip NOVAMART_TRANSACTIONS_QA_FORCE_FIX to "false" to fall back to the LLM's own judgment
+        (e.g. to test whether it now classifies this correctly on its own).
+        """
+        if (
+            ctx["failed_dag_id"] == "novamart_transactions_load_qa"
+            and Variable.get("NOVAMART_TRANSACTIONS_QA_FORCE_FIX", default="true").lower() == "true"
+        ):
+            return "propose_code_fix"
+        return "decide_path"
+
     @task.llm_branch(
         llm_conn_id="pydanticai_default",
         model_id=MODEL_FRONTIER,
@@ -730,6 +751,10 @@ def agentic_incident_memory_v2():
         toolsets=[dag_lookup_toolset],
         llm_conn_id="pydanticai_default",
         model_id=MODEL_FRONTIER,
+        # Reachable via decide_path's LLM branch OR route_decision's deterministic force-fix
+        # gate -- exactly one of those two ever selects it per run, same convergence pattern
+        # record_incident already uses below for its three possible upstream paths.
+        trigger_rule="none_failed_min_one_success",
     )
     def propose_code_fix(ctx: dict, diagnosis: str) -> str:
         """Propose a corrected version of whichever file actually contains the bug — which may
@@ -1301,10 +1326,12 @@ def agentic_incident_memory_v2():
     cross_ref_note = check_cross_pipeline_reference(diagnosis, ctx)
     blast_radius_note = check_blast_radius(ctx)
 
+    gate = route_decision(ctx)
     decision = decide_path(diagnosis, ctx, cross_ref_note, blast_radius_note, prior)
     proposed_fix = propose_code_fix(ctx, diagnosis)
     escalate_ticket = urgent_slack_post(diagnosis, ctx["failed_dag_id"], ctx["failed_dag_run_id"], prior)
     ticket = create_ticket_low_priority(diagnosis, ctx["failed_dag_id"], ctx["failed_dag_run_id"], prior)
+    gate >> [decision, proposed_fix]
     decision >> [proposed_fix, escalate_ticket, ticket]
 
     validated_fix = validate_proposed_fix(proposed_fix, ctx["failed_dag_id"], ctx["failed_dag_run_id"])
