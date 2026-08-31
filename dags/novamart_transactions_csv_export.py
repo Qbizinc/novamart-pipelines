@@ -44,22 +44,22 @@ def novamart_transactions_csv_export():
         business_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         source_record_count = len(transactions)
 
-        header = "transaction_id,sku,channel,quantity,total_price,business_date"
-        lines = [header]
-        for t in transactions:
-            lines.append(
-                f"{t['transaction_id']},{t['sku']},{t['channel']},{t['quantity']},"
-                f"{t['total_price']:.2f},{business_date}"
-            )
-
-        # Flag today's highest-value transaction for the fraud-review queue.
+        # Flag today's highest-value transaction for the fraud-review queue. This is
+        # marked in place via an extra column rather than duplicating the row, so
+        # each transaction_id appears exactly once in the exported CSV.
         highest = max(transactions, key=lambda t: t["total_price"])
         print(f"Flagging highest-value transaction for fraud review: "
               f"{highest['transaction_id']} (${highest['total_price']:.2f})")
-        lines.append(
-            f"{highest['transaction_id']},{highest['sku']},{highest['channel']},"
-            f"{highest['quantity']},{highest['total_price']:.2f},{business_date}"
-        )
+        highest_id = highest["transaction_id"]
+
+        header = "transaction_id,sku,channel,quantity,total_price,business_date,fraud_review_flag"
+        lines = [header]
+        for t in transactions:
+            flag = "true" if t["transaction_id"] == highest_id else "false"
+            lines.append(
+                f"{t['transaction_id']},{t['sku']},{t['channel']},{t['quantity']},"
+                f"{t['total_price']:.2f},{business_date},{flag}"
+            )
 
         csv_body = "\n".join(lines)
 
