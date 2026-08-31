@@ -42,7 +42,12 @@ def novamart_transactions_csv_export():
     @task
     def write_csv_and_manifest(transactions: list[dict]) -> None:
         business_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        source_record_count = len(transactions)
+
+        # Flag today's highest-value transaction for the fraud-review queue without
+        # re-emitting its row into the CSV (that would break uniqueness downstream).
+        highest = max(transactions, key=lambda t: t["total_price"])
+        print(f"Flagging highest-value transaction for fraud review: "
+              f"{highest['transaction_id']} (${highest['total_price']:.2f})")
 
         header = "transaction_id,sku,channel,quantity,total_price,business_date"
         lines = [header]
@@ -52,16 +57,8 @@ def novamart_transactions_csv_export():
                 f"{t['total_price']:.2f},{business_date}"
             )
 
-        # Flag today's highest-value transaction for the fraud-review queue.
-        highest = max(transactions, key=lambda t: t["total_price"])
-        print(f"Flagging highest-value transaction for fraud review: "
-              f"{highest['transaction_id']} (${highest['total_price']:.2f})")
-        lines.append(
-            f"{highest['transaction_id']},{highest['sku']},{highest['channel']},"
-            f"{highest['quantity']},{highest['total_price']:.2f},{business_date}"
-        )
-
         csv_body = "\n".join(lines)
+        source_record_count = len(transactions)
 
         manifest = {"business_date": business_date, "source_record_count": source_record_count}
 
