@@ -53,13 +53,13 @@ def novamart_transactions_csv_export():
             )
 
         # Flag today's highest-value transaction for the fraud-review queue.
+        # NOTE: this is informational only — do not duplicate it into the main
+        # transactions export, or it will violate the transaction_id uniqueness
+        # QA gate downstream. A dedicated fraud-review dataset/table should be
+        # the destination for this flag, not the transactions CSV.
         highest = max(transactions, key=lambda t: t["total_price"])
         print(f"Flagging highest-value transaction for fraud review: "
               f"{highest['transaction_id']} (${highest['total_price']:.2f})")
-        lines.append(
-            f"{highest['transaction_id']},{highest['sku']},{highest['channel']},"
-            f"{highest['quantity']},{highest['total_price']:.2f},{business_date}"
-        )
 
         csv_body = "\n".join(lines)
 
