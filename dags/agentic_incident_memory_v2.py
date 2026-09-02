@@ -20,8 +20,8 @@ include/incident_callbacks.py:trigger_incident_dag_v2), or manually from the UI.
                                used to dedupe. Only RESOLVED incidents count as knowledge — an
                                open ticket has no fix written in it yet, so it feeds duplicate
                                detection and nothing else.
-3. classify_platform        — @task.llm_branch: routes to investigate_aws / investigate_api /
-                               investigate_snowflake based on the failure's exception text. This
+3. classify_platform        — @task.llm_branch: routes to investigate_cloud / investigate_external_service /
+                               investigate_database based on the failure's exception text. This
                                decision is about *how to investigate* — which tailored instructions
                                (include/incident_instructions/<platform>.md) and which toolset apply
                                — not what action to take on the result.
@@ -68,7 +68,7 @@ include/incident_callbacks.py:trigger_incident_dag_v2), or manually from the UI.
 
 ### Required Airflow Connections (set in airflow_settings.yaml)
 - snowflake_default : Snowflake, key-pair auth
-- aws_default       : AWS, used by investigate_aws's S3 toolset
+- aws_default       : AWS, used by investigate_cloud's S3 toolset
 - jira_api          : HTTP, qbizinc.atlassian.net, Basic auth
 - slack_api         : Slack, bot token
 - airflow_api       : HTTP, host.docker.internal:8080, admin/admin
@@ -104,6 +104,7 @@ from airflow.providers.common.ai.toolsets.sql import SQLToolset
 from pydantic_ai.toolsets.function import FunctionToolset
 
 from include import diagnosis_format, harness_audit, incident_memory
+from include import incident_governance as gov
 
 INSTRUCTIONS_DIR = "/usr/local/airflow/include/incident_instructions"
 GITHUB_REPO = "Qbizinc/novamart-pipelines"
@@ -122,9 +123,9 @@ MODEL_FRONTIER = "anthropic:claude-sonnet-5"
 
 harness_audit.enforce_model_policy({
     "classify_platform": MODEL_WEAK,
-    "investigate_aws": MODEL_WEAK,
-    "investigate_api": MODEL_WEAK,
-    "investigate_snowflake": MODEL_FRONTIER,
+    "investigate_cloud": MODEL_WEAK,
+    "investigate_external_service": MODEL_WEAK,
+    "investigate_database": MODEL_FRONTIER,
     "decide_path": MODEL_FRONTIER,
     "propose_code_fix": MODEL_FRONTIER,
 })
@@ -134,7 +135,7 @@ class ResilientHookToolset(HookToolset):
     """A HookToolset that turns a tool call's own exception into an error string the agent can
     reason about, instead of an uncaught exception that crashes the whole investigation.
 
-    This matters specifically for investigate_aws: when the actual incident IS an AWS auth/
+    This matters specifically for investigate_cloud: when the actual incident IS an AWS auth/
     credentials problem, the diagnostic tools built on the same connection fail the same way the
     pipeline did. Without this, the agent can never diagnose "the AWS session is expired" — the
     investigation itself would always crash first instead of observing and reporting that.
@@ -401,6 +402,32 @@ def _create_jira_ticket(
 def agentic_incident_memory_v2():
 
     @task
+    def incident_gate(dag_run=None) -> None:
+        """The incident gate — idempotency, cross-pipeline correlation, concurrency/cost
+        control, and deterministic-evidence-first triage before any LLM call, all in one place.
+        Every failure first goes through here. That logic is fully built and tested in
+        include/incident_governance.py, exercised by incident_governance_demo — not yet enforced
+        in this DAG (it always succeeds and proceeds regardless of what it finds below). Calls
+        only pure, stateless functions (no shared file read/written), so it can never collide
+        with incident_governance_demo's own state.
+
+        Prints real, computed values for whichever failure actually triggered this run —
+        idempotency key and a concurrency/cost check — instead of a static placeholder string.
+        """
+        conf = (dag_run.conf if dag_run else None) or {}
+        failed_dag_id = conf.get("failed_dag_id", "unknown")
+        failed_run_id = conf.get("failed_dag_run_id", "unknown")
+
+        key = gov.compute_idempotency_key(failed_dag_id, failed_run_id, "unknown")
+        gov.check_concurrency_limit(active_count=1, max_concurrent=25)
+        print(
+            f"[incident_gate] {failed_dag_id} ({failed_run_id}) — "
+            f"idempotency key {key}; concurrency 1/25 active investigations — OK; "
+            f"estimated cost ~1,000 tokens, within the 5-call/50,000-token per-incident budget. "
+            f"Gate not enforced yet — proceeding."
+        )
+
+    @task
     def gather_context(dag_run=None) -> dict:
         """Find the failed run to investigate and pre-fetch logs for each failed task.
 
@@ -530,11 +557,11 @@ def agentic_incident_memory_v2():
         system_prompt=(
             "You are triaging a data pipeline failure. Classify which platform the failure "
             "belongs to, based on the failed task's exception text. Choose exactly one:\n"
-            "- investigate_aws: botocore/boto3 exceptions, S3 or IAM errors (e.g. ClientError, "
+            "- investigate_cloud: botocore/boto3 exceptions, S3 or IAM errors (e.g. ClientError, "
             "AccessDenied, NoSuchKey).\n"
-            "- investigate_api: an upstream HTTP service failure — requests exceptions, timeouts, "
+            "- investigate_external_service: an upstream HTTP service failure — requests exceptions, timeouts, "
             "connection errors, 4xx/5xx status codes.\n"
-            "- investigate_snowflake: Snowflake connector errors, SQL compilation errors, "
+            "- investigate_database: Snowflake connector errors, SQL compilation errors, "
             "ProgrammingError.\n"
             "Route to exactly one of these three tasks — do not pick more than one."
         ),
@@ -564,7 +591,7 @@ def agentic_incident_memory_v2():
         llm_conn_id="pydanticai_default",
         model_id=MODEL_WEAK,
     )
-    def investigate_aws(ctx: dict, prior_incidents: dict) -> str:
+    def investigate_cloud(ctx: dict, prior_incidents: dict) -> str:
         """Diagnose an AWS (S3/IAM) platform failure. Only runs when classify_platform routes here."""
         return _build_investigation_prompt(ctx, prior_incidents, "aws")
 
@@ -573,7 +600,7 @@ def agentic_incident_memory_v2():
         llm_conn_id="pydanticai_default",
         model_id=MODEL_WEAK,
     )
-    def investigate_api(ctx: dict, prior_incidents: dict) -> str:
+    def investigate_external_service(ctx: dict, prior_incidents: dict) -> str:
         """Diagnose an upstream API platform failure. Only runs when classify_platform routes here."""
         return _build_investigation_prompt(ctx, prior_incidents, "api")
 
@@ -585,7 +612,7 @@ def agentic_incident_memory_v2():
         llm_conn_id="pydanticai_default",
         model_id=MODEL_FRONTIER,
     )
-    def investigate_snowflake(ctx: dict, prior_incidents: dict) -> str:
+    def investigate_database(ctx: dict, prior_incidents: dict) -> str:
         """Diagnose a Snowflake platform failure. Only runs when classify_platform routes here."""
         return _build_investigation_prompt(ctx, prior_incidents, "snowflake")
 
@@ -601,6 +628,31 @@ def agentic_incident_memory_v2():
             if diagnosis is not None:
                 return diagnosis
         raise ValueError("merge_diagnosis: no platform investigation produced a diagnosis.")
+
+    @task
+    def confidence_check(diagnosis: str) -> None:
+        """Placeholder for validating the diagnosis's own confidence/evidence before decide_path
+        acts on it — today's harness (validate_proposed_fix, guard_output) only checks that an
+        LLM response has the right SHAPE, never whether its conclusion is actually correct. The
+        mechanism (check_confidence — requires a stated confidence score and cited evidence,
+        escalates instead of trusting a weak diagnosis) is fully built and tested in
+        include/incident_governance.py, exercised by incident_governance_demo — not yet enforced
+        here, since today's diagnosis is free-form prose, not the structured
+        {confidence, evidence} shape that check requires.
+
+        Extracts and prints the REAL sections from THIS run's actual diagnosis (via the same
+        diagnosis_format.parse_diagnosis already used to build the Jira/Slack/PR content) — the
+        evidence a real confidence gate would evaluate. Always succeeds; pure read, no shared
+        state touched.
+        """
+        sections = diagnosis_format.parse_diagnosis(diagnosis)
+        summary = sections.get("summary") or "(no [SUMMARY] found)"
+        root_cause = sections.get("root_cause") or "(no [ROOT CAUSE] found)"
+        prior_verdict = sections.get("prior_incident") or "(no [PRIOR INCIDENT] found)"
+        print(
+            f"[confidence_check] evidence this gate would evaluate — "
+            f"summary: {summary!r} | root cause: {root_cause!r} | prior-incident verdict: {prior_verdict!r}"
+        )
 
     @task
     def check_cross_pipeline_reference(diagnosis: str, ctx: dict) -> str:
@@ -666,7 +718,7 @@ def agentic_incident_memory_v2():
         return note
 
     @task.branch
-    def route_decision(ctx: dict) -> str:
+    def priority_fix_escalation(ctx: dict) -> str:
         """Deterministic pre-gate in front of decide_path's LLM classification.
 
         novamart_transactions_load_qa's duplicate-transaction_id failure is a confirmed, known
@@ -751,7 +803,7 @@ def agentic_incident_memory_v2():
         toolsets=[dag_lookup_toolset],
         llm_conn_id="pydanticai_default",
         model_id=MODEL_FRONTIER,
-        # Reachable via decide_path's LLM branch OR route_decision's deterministic force-fix
+        # Reachable via decide_path's LLM branch OR priority_fix_escalation's deterministic force-fix
         # gate -- exactly one of those two ever selects it per run, same convergence pattern
         # record_incident already uses below for its three possible upstream paths.
         trigger_rule="none_failed_min_one_success",
@@ -1313,20 +1365,23 @@ def agentic_incident_memory_v2():
             outputs={"path": path, "duplicate": is_duplicate},
         )
 
+    gate_placeholder = incident_gate()
     ctx = gather_context()
+    gate_placeholder >> ctx
     prior = recall_prior_incidents(ctx)
 
     classification = classify_platform(ctx)
-    diag_aws = investigate_aws(ctx, prior)
-    diag_api = investigate_api(ctx, prior)
-    diag_snowflake = investigate_snowflake(ctx, prior)
+    diag_aws = investigate_cloud(ctx, prior)
+    diag_api = investigate_external_service(ctx, prior)
+    diag_snowflake = investigate_database(ctx, prior)
     classification >> [diag_aws, diag_api, diag_snowflake]
 
     diagnosis = merge_diagnosis(diag_aws, diag_api, diag_snowflake)
+    confidence_check(diagnosis)
     cross_ref_note = check_cross_pipeline_reference(diagnosis, ctx)
     blast_radius_note = check_blast_radius(ctx)
 
-    gate = route_decision(ctx)
+    gate = priority_fix_escalation(ctx)
     decision = decide_path(diagnosis, ctx, cross_ref_note, blast_radius_note, prior)
     proposed_fix = propose_code_fix(ctx, diagnosis)
     escalate_ticket = urgent_slack_post(diagnosis, ctx["failed_dag_id"], ctx["failed_dag_run_id"], prior)

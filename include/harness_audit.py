@@ -132,9 +132,9 @@ def new_model_policy():
     object, not one per DAG, the same way a real org would centrally govern model-tier spend
     rather than let each pipeline define its own rules.
 
-    classify_platform/investigate_aws/investigate_api are cheap triage/classification steps and
+    classify_platform/investigate_cloud/investigate_external_service are cheap triage/classification steps and
     are capped at WEAK on purpose (cost control — a trivial step shouldn't self-escalate).
-    investigate_snowflake/decide_path/propose_code_fix are hard-floored at FRONTIER: this session
+    investigate_database/decide_path/propose_code_fix are hard-floored at FRONTIER: this session
     found by direct experiment that a WEAK model on these steps finds the right evidence and then
     reasons past it anyway (see git history) — that floor is evidence-backed, not a preference.
     summarize_exec_report (novamart_exec_sales_report) is capped at WEAK for the opposite reason:
@@ -150,9 +150,9 @@ def new_model_policy():
     }
     activities = {
         "classify_platform": ActivityBand(max_tier=Tier.WEAK),
-        "investigate_aws": ActivityBand(max_tier=Tier.WEAK),
-        "investigate_api": ActivityBand(max_tier=Tier.WEAK),
-        "investigate_snowflake": ActivityBand(max_tier=Tier.FRONTIER, min_tier=Tier.FRONTIER, floor_hard=True),
+        "investigate_cloud": ActivityBand(max_tier=Tier.WEAK),
+        "investigate_external_service": ActivityBand(max_tier=Tier.WEAK),
+        "investigate_database": ActivityBand(max_tier=Tier.FRONTIER, min_tier=Tier.FRONTIER, floor_hard=True),
         "decide_path": ActivityBand(max_tier=Tier.FRONTIER, min_tier=Tier.FRONTIER, floor_hard=True),
         "propose_code_fix": ActivityBand(max_tier=Tier.FRONTIER, min_tier=Tier.FRONTIER, floor_hard=True),
         "summarize_exec_report": ActivityBand(max_tier=Tier.WEAK),

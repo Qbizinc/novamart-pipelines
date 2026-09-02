@@ -6,7 +6,7 @@ import requests
 from airflow.sdk import Asset, Variable, dag, task
 from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
 
-from include.incident_callbacks import trigger_incident_dag_v2
+from include.incident_callbacks import trigger_governance_demo, trigger_incident_dag_v2
 
 MARKETING_API_DEFAULT = "http://host.docker.internal:5003"
 CAMPAIGNS_TABLE = "SANDBOX_DATA_PIPELINE.NOVAMART_RAW.MARKETING_CAMPAIGNS"
@@ -20,7 +20,7 @@ MARKETING_CAMPAIGNS_ASSET = Asset("marketing_campaigns")
     catchup=False,
     doc_md=__doc__,
     tags=["novamart", "marketing"],
-    default_args={"on_failure_callback": trigger_incident_dag_v2},
+    default_args={"on_failure_callback": [trigger_incident_dag_v2, trigger_governance_demo]},
 )
 def novamart_marketing_campaigns_ingest():
 

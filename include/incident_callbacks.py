@@ -59,3 +59,10 @@ def trigger_incident_dag(context) -> None:
 def trigger_incident_dag_v2(context) -> None:
     """Task on_failure_callback — fires agentic_incident_memory_v2 (router prototype)."""
     _trigger_incident_dag("agentic_incident_memory_v2", context)
+
+
+def trigger_governance_demo(context) -> None:
+    """Task on_failure_callback — fires incident_governance_demo (scalability reference, not
+    the real incident-response flow). Added alongside trigger_incident_dag_v2, not instead of
+    it, so a real failure now also demonstrates the callback-gate pattern live."""
+    _trigger_incident_dag("incident_governance_demo", context)
