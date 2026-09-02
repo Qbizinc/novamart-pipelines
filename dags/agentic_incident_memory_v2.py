@@ -402,7 +402,7 @@ def _create_jira_ticket(
 def agentic_incident_memory_v2():
 
     @task
-    def incident_gate(dag_run=None) -> None:
+    def incident_gate(ctx: dict) -> None:
         """The incident gate — idempotency, cross-pipeline correlation, concurrency/cost
         control, and deterministic-evidence-first triage before any LLM call, all in one place.
         Every failure first goes through here. That logic is fully built and tested in
@@ -411,17 +411,22 @@ def agentic_incident_memory_v2():
         only pure, stateless functions (no shared file read/written), so it can never collide
         with incident_governance_demo's own state.
 
+        Runs after gather_context (not before it) — it needs the actual failed task_id to compute
+        a real idempotency key, and gather_context's own API calls are cheap reads, not the LLM
+        spend this gate exists to guard. It still runs before classify_platform/investigate_*,
+        which are the actual LLM calls.
+
         Prints real, computed values for whichever failure actually triggered this run —
         idempotency key and a concurrency/cost check — instead of a static placeholder string.
         """
-        conf = (dag_run.conf if dag_run else None) or {}
-        failed_dag_id = conf.get("failed_dag_id", "unknown")
-        failed_run_id = conf.get("failed_dag_run_id", "unknown")
+        failed_dag_id = ctx["failed_dag_id"]
+        failed_run_id = ctx["failed_dag_run_id"]
+        failed_task_id = ctx["failed_tasks"][0]["task_id"] if ctx["failed_tasks"] else "unknown"
 
-        key = gov.compute_idempotency_key(failed_dag_id, failed_run_id, "unknown")
+        key = gov.compute_idempotency_key(failed_dag_id, failed_run_id, failed_task_id)
         gov.check_concurrency_limit(active_count=1, max_concurrent=25)
         print(
-            f"[incident_gate] {failed_dag_id} ({failed_run_id}) — "
+            f"[incident_gate] {failed_dag_id} ({failed_run_id}), task={failed_task_id} — "
             f"idempotency key {key}; concurrency 1/25 active investigations — OK; "
             f"estimated cost ~1,000 tokens, within the 5-call/50,000-token per-incident budget. "
             f"Gate not enforced yet — proceeding."
@@ -1381,10 +1386,10 @@ def agentic_incident_memory_v2():
             outputs={"path": path, "duplicate": is_duplicate},
         )
 
-    gate_placeholder = incident_gate()
     ctx = gather_context()
-    gate_placeholder >> ctx
+    gate_placeholder = incident_gate(ctx)
     prior = recall_prior_incidents(ctx)
+    gate_placeholder >> prior
 
     classification = classify_platform(ctx)
     diag_aws = investigate_cloud(ctx, prior)
