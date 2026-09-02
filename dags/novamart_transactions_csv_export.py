@@ -53,13 +53,11 @@ def novamart_transactions_csv_export():
             )
 
         # Flag today's highest-value transaction for the fraud-review queue.
+        # This is a side-channel log line only — it must NOT add another row to the
+        # exported CSV, since that would duplicate the transaction in TRANSACTIONS_SUMMARY.
         highest = max(transactions, key=lambda t: t["total_price"])
-        print(f"Flagging highest-value transaction for fraud review: "
+        print(f"FRAUD_REVIEW_FLAG: highest-value transaction for review: "
               f"{highest['transaction_id']} (${highest['total_price']:.2f})")
-        lines.append(
-            f"{highest['transaction_id']},{highest['sku']},{highest['channel']},"
-            f"{highest['quantity']},{highest['total_price']:.2f},{business_date}"
-        )
 
         csv_body = "\n".join(lines)
 
