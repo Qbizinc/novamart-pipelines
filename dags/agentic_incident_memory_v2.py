@@ -640,19 +640,35 @@ def agentic_incident_memory_v2():
         here, since today's diagnosis is free-form prose, not the structured
         {confidence, evidence} shape that check requires.
 
-        Extracts and prints the REAL sections from THIS run's actual diagnosis (via the same
-        diagnosis_format.parse_diagnosis already used to build the Jira/Slack/PR content) — the
-        evidence a real confidence gate would evaluate. Always succeeds; pure read, no shared
-        state touched.
+        Extracts the REAL sections from THIS run's actual diagnosis (via the same
+        diagnosis_format.parse_diagnosis already used to build the Jira/Slack/PR content) and
+        scores them against a weighted checklist — the same shape of evidence a real confidence
+        gate would require before decide_path acts on it. Always succeeds; pure read, no shared
+        state touched; the score is printed only, nothing branches on it yet.
         """
         sections = diagnosis_format.parse_diagnosis(diagnosis)
-        summary = sections.get("summary") or "(no [SUMMARY] found)"
-        root_cause = sections.get("root_cause") or "(no [ROOT CAUSE] found)"
-        prior_verdict = sections.get("prior_incident") or "(no [PRIOR INCIDENT] found)"
-        print(
-            f"[confidence_check] evidence this gate would evaluate — "
-            f"summary: {summary!r} | root cause: {root_cause!r} | prior-incident verdict: {prior_verdict!r}"
-        )
+
+        def _present(key: str) -> bool:
+            value = (sections.get(key) or "").strip().lower()
+            return bool(value) and value not in ("none", "none.", "n/a", "unknown")
+
+        hedge_words = ("unclear", "unknown", "uncertain", "not sure", "possibly", "may be")
+        diagnosis_text = (sections.get("diagnosis") or "").lower()
+
+        checklist = [
+            ("Root cause directly supported by logs", 0.35, _present("root_cause")),
+            ("Code confirms the suspected behavior", 0.30, _present("recommended_fix")),
+            ("Data evidence confirms the failure", 0.20, _present("impact")),
+            ("No conflicting evidence", 0.15, not any(w in diagnosis_text for w in hedge_words)),
+        ]
+        confidence = sum(weight for _, weight, hit in checklist if hit)
+
+        print("[confidence_check] evidence checklist for this diagnosis:")
+        for label, weight, hit in checklist:
+            mark = "+" if hit else " "
+            print(f"  [{mark}] {weight:.2f}  {label}")
+        print(f"  {'-' * 32}")
+        print(f"        Confidence = {confidence:.2f}")
 
     @task
     def check_cross_pipeline_reference(diagnosis: str, ctx: dict) -> str:
