@@ -88,6 +88,7 @@ import base64
 import json
 import os
 import re
+import time
 from datetime import datetime
 
 import requests
@@ -469,18 +470,29 @@ def agentic_incident_memory_v2():
                 raise ValueError(f"No failed runs found for {failed_dag_id}.")
             failed_run_id = runs[0]["dag_run_id"]
 
-        r2 = requests.get(
-            f"{base_url}/api/v2/dags/{failed_dag_id}/dagRuns/{failed_run_id}/taskInstances",
-            headers=headers,
-            timeout=10,
-        )
-        r2.raise_for_status()
-        instances = r2.json().get("task_instances", [])
-        failed_tasks = [
-            {"task_id": t["task_id"], "state": t["state"]}
-            for t in instances
-            if t["state"] == "failed"
-        ]
+        # A task's on_failure_callback fires the instant its exception is caught, which can beat
+        # the supervisor committing that task instance's final "failed" state to the DB by a
+        # couple seconds — a first read here can land in that gap and see nothing failed yet
+        # (observed live: gather_context returned empty on a real qa_check_uniqueness failure
+        # because it ran ~3s before that task's failed state was persisted). Retry briefly before
+        # accepting "no failed tasks" as real.
+        failed_tasks: list[dict] = []
+        for attempt in range(4):
+            r2 = requests.get(
+                f"{base_url}/api/v2/dags/{failed_dag_id}/dagRuns/{failed_run_id}/taskInstances",
+                headers=headers,
+                timeout=10,
+            )
+            r2.raise_for_status()
+            instances = r2.json().get("task_instances", [])
+            failed_tasks = [
+                {"task_id": t["task_id"], "state": t["state"]}
+                for t in instances
+                if t["state"] == "failed"
+            ]
+            if failed_tasks or attempt == 3:
+                break
+            time.sleep(2)
 
         task_logs: dict[str, str] = {}
         for t in failed_tasks:
