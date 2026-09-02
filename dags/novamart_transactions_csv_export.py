@@ -53,17 +53,20 @@ def novamart_transactions_csv_export():
             )
 
         # Flag today's highest-value transaction for the fraud-review queue.
+        # This must not duplicate the transaction as an extra CSV row — the
+        # transaction_id has to remain unique per row in the source file, so
+        # the flag is recorded separately in the manifest instead.
         highest = max(transactions, key=lambda t: t["total_price"])
         print(f"Flagging highest-value transaction for fraud review: "
               f"{highest['transaction_id']} (${highest['total_price']:.2f})")
-        lines.append(
-            f"{highest['transaction_id']},{highest['sku']},{highest['channel']},"
-            f"{highest['quantity']},{highest['total_price']:.2f},{business_date}"
-        )
 
         csv_body = "\n".join(lines)
 
-        manifest = {"business_date": business_date, "source_record_count": source_record_count}
+        manifest = {
+            "business_date": business_date,
+            "source_record_count": source_record_count,
+            "fraud_review_transaction_id": highest["transaction_id"],
+        }
 
         bucket = Variable.get("NOVAMART_S3_BUCKET")
         hook = S3Hook(aws_conn_id="aws_default")
